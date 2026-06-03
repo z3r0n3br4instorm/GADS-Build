@@ -4,22 +4,24 @@ set -euo pipefail
 # ============================================================
 # GADS Installation Script (Raspberry Pi 5)
 # ============================================================
-# Installs MongoDB, extracts the GADS binary, creates systemd
-# hub + provider services, and starts everything.
+# Installs Docker, runs MongoDB in a container, extracts the
+# GADS binary, and creates systemd hub + provider services.
 
 # ---------- Configuration ----------
 GADS_USER="${GADS_USER:-$USER}"
 GADS_DIR="${GADS_DIR:-/home/$GADS_USER/GADS}"
 ZIP_FILE="$(cd "$(dirname "$0")" && pwd)/GADS.zip"
 
-# MongoDB version
+# MongoDB container
 MONGO_VERSION="${MONGO_VERSION:-7.0}"
+MONGO_CONTAINER="${MONGO_CONTAINER:-gads-mongodb}"
+MONGO_PORT="${MONGO_PORT:-27017}"
 
 # Hub settings
 HUB_HOST="${HUB_HOST:-0.0.0.0}"
 HUB_PORT="${HUB_PORT:-10000}"
 HUB_AUTH="${HUB_AUTH:-true}"
-MONGO_DB="${MONGO_DB:-localhost:27017}"
+MONGO_DSN="${MONGO_DSN:-localhost:${MONGO_PORT}}"
 
 # Provider settings
 PROVIDER_NICKNAME="${PROVIDER_NICKNAME:-pi-provider}"
@@ -50,54 +52,58 @@ if [[ "$ARCH" != "arm64" ]]; then
 fi
 
 # ============================================================
-# 1. Install MongoDB
+# 1. Install Docker
 # ============================================================
-install_mongodb() {
-  if command -v mongod &>/dev/null; then
-    log "MongoDB is already installed: $(mongod --version 2>/dev/null | head -1)"
-    return 0
-  fi
-
-  log "Installing MongoDB $MONGO_VERSION for $ARCH..."
-
-  # Import GPG key
-  curl -fsSL https://www.mongodb.org/static/pgp/server-${MONGO_VERSION}.asc \
-    | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg
-
-  # Add repo (MongoDB provides arm64 packages for Ubuntu/Debian)
-  . /etc/os-release
-  if [[ "$ID" == "raspbian" ]]; then
-    # Raspbian → use Debian repo
-    REPO_DISTRO="debian"
-    REPO_CODENAME="bookworm"
-  elif [[ "$ID" == "ubuntu" ]]; then
-    REPO_DISTRO="ubuntu"
-    REPO_CODENAME="${VERSION_CODENAME:-$UBUNTU_CODENAME}"
-  elif [[ "$ID" == "debian" ]]; then
-    REPO_DISTRO="debian"
-    REPO_CODENAME="${VERSION_CODENAME}"
+install_docker() {
+  if command -v docker &>/dev/null; then
+    log "Docker is already installed: $(docker --version)"
   else
-    REPO_DISTRO="debian"
-    REPO_CODENAME="bookworm"
-    warn "Unknown distro '$ID', defaulting to debian bookworm."
+    log "Installing Docker..."
+    curl -fsSL https://get.docker.com | sudo sh
   fi
 
-  echo "deb [arch=arm64 trusted=yes] \
-https://repo.mongodb.org/apt/${REPO_DISTRO} ${REPO_CODENAME}/mongodb-org/${MONGO_VERSION} main" \
-    | sudo tee /etc/apt/sources.list.d/mongodb-org-${MONGO_VERSION}.list > /dev/null
+  log "Adding $GADS_USER to docker group..."
+  sudo usermod -aG docker "$GADS_USER" || true
 
-  sudo apt-get update
-  sudo apt-get install -y mongodb-org
-
-  log "Starting and enabling mongod..."
-  sudo systemctl enable mongod
-  sudo systemctl start mongod
-
-  log "MongoDB installed and running."
+  log "Refreshing group membership..."
+  sg docker -c "echo '  Docker group active for this session'" || true
+  warn "You may need to log out and back in for docker group to take full effect."
 }
 
 # ============================================================
-# 2. Stop existing GADS services
+# 2. Start MongoDB in Docker
+# ============================================================
+start_mongodb() {
+  # Stop+remove old container if it exists
+  if sudo docker ps -a --format '{{.Names}}' | grep -q "^${MONGO_CONTAINER}$"; then
+    log "Removing existing MongoDB container..."
+    sudo docker rm -f "$MONGO_CONTAINER" || true
+  fi
+
+  log "Pulling MongoDB ${MONGO_VERSION} image (ARM64)..."
+  sudo docker pull "mongo:${MONGO_VERSION}"
+
+  log "Starting MongoDB container (${MONGO_CONTAINER})..."
+  sudo docker run -d \
+    --name "$MONGO_CONTAINER" \
+    --restart always \
+    -p "127.0.0.1:${MONGO_PORT}:27017" \
+    -v gads-mongo-data:/data/db \
+    "mongo:${MONGO_VERSION}"
+
+  log "Waiting for MongoDB to be ready..."
+  for i in $(seq 1 30); do
+    if sudo docker exec "$MONGO_CONTAINER" mongosh --quiet --eval "db.runCommand({ping:1})" &>/dev/null; then
+      log "MongoDB is ready."
+      return 0
+    fi
+    sleep 1
+  done
+  err "MongoDB failed to start within 30s."
+}
+
+# ============================================================
+# 3. Stop existing GADS services
 # ============================================================
 stop_gads() {
   log "Stopping existing GADS services (if running)..."
@@ -105,7 +111,7 @@ stop_gads() {
 }
 
 # ============================================================
-# 3. Extract GADS binary
+# 4. Extract GADS binary
 # ============================================================
 extract_gads() {
   log "Creating working directory: $GADS_DIR"
@@ -122,7 +128,7 @@ extract_gads() {
 }
 
 # ============================================================
-# 4. Create systemd services
+# 5. Create systemd services
 # ============================================================
 create_services() {
   HUB_SERVICE="/etc/systemd/system/gads-hub.service"
@@ -131,8 +137,8 @@ create_services() {
   sudo tee "$HUB_SERVICE" > /dev/null <<EOF
 [Unit]
 Description=GADS Hub
-After=network.target mongod.service
-Requires=mongod.service
+After=network.target docker.service
+Requires=docker.service
 
 [Service]
 Type=simple
@@ -142,7 +148,7 @@ ExecStart=$GADS_DIR/GADS hub \\
   --host-address=$HUB_HOST \\
   --port=$HUB_PORT \\
   --auth=$HUB_AUTH \\
-  --mongo-db=$MONGO_DB
+  --mongo-db=$MONGO_DSN
 Restart=on-failure
 RestartSec=5
 
@@ -156,7 +162,7 @@ EOF
   sudo tee "$PROVIDER_SERVICE" > /dev/null <<EOF
 [Unit]
 Description=GADS Provider
-After=network.target gads-hub.service mongod.service
+After=network.target gads-hub.service docker.service
 Wants=gads-hub.service
 
 [Service]
@@ -168,7 +174,7 @@ ExecStartPre=/bin/sleep 5
 ExecStart=$GADS_DIR/GADS provider \\
   --nickname=$PROVIDER_NICKNAME \\
   --hub=$PROVIDER_HUB \\
-  --mongo-db=$MONGO_DB
+  --mongo-db=$MONGO_DSN
 Restart=on-failure
 RestartSec=10
 
@@ -178,7 +184,7 @@ EOF
 }
 
 # ============================================================
-# 5. Enable and start GADS services
+# 6. Enable and start GADS services
 # ============================================================
 start_gads() {
   log "Reloading systemd daemon..."
@@ -195,7 +201,7 @@ start_gads() {
 }
 
 # ============================================================
-# 6. Show status
+# 7. Show status
 # ============================================================
 show_status() {
   echo ""
@@ -204,8 +210,8 @@ show_status() {
   log "============================================"
   echo ""
 
-  log "MongoDB status:"
-  sudo systemctl status mongod --no-pager -l || true
+  log "Docker / MongoDB container:"
+  sudo docker ps --filter "name=${MONGO_CONTAINER}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
   echo ""
   log "Hub service status:"
   sudo systemctl status gads-hub --no-pager -l || true
@@ -215,7 +221,8 @@ show_status() {
 
   echo ""
   log "Useful commands:"
-  log "  sudo systemctl status mongod"
+  log "  sudo docker ps                          # Check MongoDB container"
+  log "  sudo docker logs gads-mongodb           # MongoDB logs"
   log "  sudo systemctl status gads-hub"
   log "  sudo systemctl status gads-provider"
   log "  sudo journalctl -u gads-hub -f"
@@ -225,7 +232,8 @@ show_status() {
 # ============================================================
 # Run
 # ============================================================
-install_mongodb
+install_docker
+start_mongodb
 stop_gads
 extract_gads
 create_services
