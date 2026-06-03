@@ -41,6 +41,10 @@ if [[ ! -f "$ZIP_FILE" ]]; then
   err "GADS.zip not found at $ZIP_FILE"
 fi
 
+# ---------- Stop existing services ----------
+log "Stopping existing services (if running)..."
+sudo systemctl stop gads-hub gads-provider 2>/dev/null || true
+
 # ---------- Create working directory ----------
 log "Creating working directory: $GADS_DIR"
 sudo mkdir -p "$GADS_DIR"
@@ -63,8 +67,7 @@ log "Creating $HUB_SERVICE"
 sudo tee "$HUB_SERVICE" > /dev/null <<EOF
 [Unit]
 Description=GADS Hub
-After=network.target docker.service
-Requires=docker.service
+After=network.target
 
 [Service]
 Type=simple
