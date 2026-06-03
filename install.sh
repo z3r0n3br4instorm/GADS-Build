@@ -82,7 +82,7 @@ install_mongodb() {
     warn "Unknown distro '$ID', defaulting to debian bookworm."
   fi
 
-  echo "deb [arch=arm64 signed-by=/usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg] \
+  echo "deb [arch=arm64 trusted=yes] \
 https://repo.mongodb.org/apt/${REPO_DISTRO} ${REPO_CODENAME}/mongodb-org/${MONGO_VERSION} main" \
     | sudo tee /etc/apt/sources.list.d/mongodb-org-${MONGO_VERSION}.list > /dev/null
 
