@@ -2,15 +2,18 @@
 set -euo pipefail
 
 # ============================================================
-# GADS Installation Script
+# GADS Installation Script (Raspberry Pi 5)
 # ============================================================
-# Extracts the GADS binary, creates systemd hub + provider
-# services, and starts them.
+# Installs MongoDB, extracts the GADS binary, creates systemd
+# hub + provider services, and starts everything.
 
 # ---------- Configuration ----------
 GADS_USER="${GADS_USER:-$USER}"
 GADS_DIR="${GADS_DIR:-/home/$GADS_USER/GADS}"
 ZIP_FILE="$(cd "$(dirname "$0")" && pwd)/GADS.zip"
+
+# MongoDB version
+MONGO_VERSION="${MONGO_VERSION:-7.0}"
 
 # Hub settings
 HUB_HOST="${HUB_HOST:-0.0.0.0}"
@@ -41,33 +44,95 @@ if [[ ! -f "$ZIP_FILE" ]]; then
   err "GADS.zip not found at $ZIP_FILE"
 fi
 
-# ---------- Stop existing services ----------
-log "Stopping existing services (if running)..."
-sudo systemctl stop gads-hub gads-provider 2>/dev/null || true
+ARCH="$(dpkg --print-architecture)"
+if [[ "$ARCH" != "arm64" ]]; then
+  warn "Expected arm64 (Raspberry Pi 5 64-bit), got $ARCH. Proceeding anyway..."
+fi
 
-# ---------- Create working directory ----------
-log "Creating working directory: $GADS_DIR"
-sudo mkdir -p "$GADS_DIR"
+# ============================================================
+# 1. Install MongoDB
+# ============================================================
+install_mongodb() {
+  if command -v mongod &>/dev/null; then
+    log "MongoDB is already installed: $(mongod --version 2>/dev/null | head -1)"
+    return 0
+  fi
 
-# ---------- Extract binary ----------
-log "Extracting GADS binary..."
-sudo unzip -o "$ZIP_FILE" -d "$GADS_DIR"
+  log "Installing MongoDB $MONGO_VERSION for $ARCH..."
 
-log "Making GADS executable..."
-sudo chmod +x "$GADS_DIR/GADS"
+  # Import GPG key
+  curl -fsSL https://www.mongodb.org/static/pgp/server-${MONGO_VERSION}.asc \
+    | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg
 
-# ---------- Set ownership ----------
-log "Setting ownership to $GADS_USER..."
-sudo chown -R "$GADS_USER:$GADS_USER" "$GADS_DIR"
+  # Add repo (MongoDB provides arm64 packages for Ubuntu/Debian)
+  . /etc/os-release
+  if [[ "$ID" == "raspbian" ]]; then
+    # Raspbian → use Debian repo
+    REPO_DISTRO="debian"
+    REPO_CODENAME="bookworm"
+  elif [[ "$ID" == "ubuntu" ]]; then
+    REPO_DISTRO="ubuntu"
+    REPO_CODENAME="${VERSION_CODENAME:-$UBUNTU_CODENAME}"
+  elif [[ "$ID" == "debian" ]]; then
+    REPO_DISTRO="debian"
+    REPO_CODENAME="${VERSION_CODENAME}"
+  else
+    REPO_DISTRO="debian"
+    REPO_CODENAME="bookworm"
+    warn "Unknown distro '$ID', defaulting to debian bookworm."
+  fi
 
-# ---------- Create systemd service: gads-hub ----------
-HUB_SERVICE="/etc/systemd/system/gads-hub.service"
-log "Creating $HUB_SERVICE"
+  echo "deb [arch=arm64 signed-by=/usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg] \
+https://repo.mongodb.org/apt/${REPO_DISTRO} ${REPO_CODENAME}/mongodb-org/${MONGO_VERSION} main" \
+    | sudo tee /etc/apt/sources.list.d/mongodb-org-${MONGO_VERSION}.list > /dev/null
 
-sudo tee "$HUB_SERVICE" > /dev/null <<EOF
+  sudo apt-get update
+  sudo apt-get install -y mongodb-org
+
+  log "Starting and enabling mongod..."
+  sudo systemctl enable mongod
+  sudo systemctl start mongod
+
+  log "MongoDB installed and running."
+}
+
+# ============================================================
+# 2. Stop existing GADS services
+# ============================================================
+stop_gads() {
+  log "Stopping existing GADS services (if running)..."
+  sudo systemctl stop gads-hub gads-provider 2>/dev/null || true
+}
+
+# ============================================================
+# 3. Extract GADS binary
+# ============================================================
+extract_gads() {
+  log "Creating working directory: $GADS_DIR"
+  sudo mkdir -p "$GADS_DIR"
+
+  log "Extracting GADS binary..."
+  sudo unzip -o "$ZIP_FILE" -d "$GADS_DIR"
+
+  log "Making GADS executable..."
+  sudo chmod +x "$GADS_DIR/GADS"
+
+  log "Setting ownership to $GADS_USER..."
+  sudo chown -R "$GADS_USER:$GADS_USER" "$GADS_DIR"
+}
+
+# ============================================================
+# 4. Create systemd services
+# ============================================================
+create_services() {
+  HUB_SERVICE="/etc/systemd/system/gads-hub.service"
+  log "Creating $HUB_SERVICE"
+
+  sudo tee "$HUB_SERVICE" > /dev/null <<EOF
 [Unit]
 Description=GADS Hub
-After=network.target
+After=network.target mongod.service
+Requires=mongod.service
 
 [Service]
 Type=simple
@@ -85,14 +150,13 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# ---------- Create systemd service: gads-provider ----------
-PROVIDER_SERVICE="/etc/systemd/system/gads-provider.service"
-log "Creating $PROVIDER_SERVICE"
+  PROVIDER_SERVICE="/etc/systemd/system/gads-provider.service"
+  log "Creating $PROVIDER_SERVICE"
 
-sudo tee "$PROVIDER_SERVICE" > /dev/null <<EOF
+  sudo tee "$PROVIDER_SERVICE" > /dev/null <<EOF
 [Unit]
 Description=GADS Provider
-After=network.target gads-hub.service
+After=network.target gads-hub.service mongod.service
 Wants=gads-hub.service
 
 [Service]
@@ -111,38 +175,59 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
-# ---------- Reload systemd ----------
-log "Reloading systemd daemon..."
-sudo systemctl daemon-reload
+# ============================================================
+# 5. Enable and start GADS services
+# ============================================================
+start_gads() {
+  log "Reloading systemd daemon..."
+  sudo systemctl daemon-reload
 
-# ---------- Enable services ----------
-log "Enabling gads-hub and gads-provider..."
-sudo systemctl enable gads-hub gads-provider
+  log "Enabling gads-hub and gads-provider..."
+  sudo systemctl enable gads-hub gads-provider
 
-# ---------- Start services ----------
-log "Starting gads-hub..."
-sudo systemctl start gads-hub
-sleep 5
-log "Starting gads-provider..."
-sudo systemctl start gads-provider
+  log "Starting gads-hub..."
+  sudo systemctl start gads-hub
+  sleep 5
+  log "Starting gads-provider..."
+  sudo systemctl start gads-provider
+}
 
-# ---------- Status ----------
-echo ""
-log "============================================"
-log "  Installation complete!"
-log "============================================"
-echo ""
+# ============================================================
+# 6. Show status
+# ============================================================
+show_status() {
+  echo ""
+  log "============================================"
+  log "  Installation complete!"
+  log "============================================"
+  echo ""
 
-log "Hub service status:"
-sudo systemctl status gads-hub --no-pager -l || true
-echo ""
-log "Provider service status:"
-sudo systemctl status gads-provider --no-pager -l || true
+  log "MongoDB status:"
+  sudo systemctl status mongod --no-pager -l || true
+  echo ""
+  log "Hub service status:"
+  sudo systemctl status gads-hub --no-pager -l || true
+  echo ""
+  log "Provider service status:"
+  sudo systemctl status gads-provider --no-pager -l || true
 
-echo ""
-log "Useful commands:"
-log "  sudo systemctl status gads-hub"
-log "  sudo systemctl status gads-provider"
-log "  sudo journalctl -u gads-hub -f"
-log "  sudo journalctl -u gads-provider -f"
+  echo ""
+  log "Useful commands:"
+  log "  sudo systemctl status mongod"
+  log "  sudo systemctl status gads-hub"
+  log "  sudo systemctl status gads-provider"
+  log "  sudo journalctl -u gads-hub -f"
+  log "  sudo journalctl -u gads-provider -f"
+}
+
+# ============================================================
+# Run
+# ============================================================
+install_mongodb
+stop_gads
+extract_gads
+create_services
+start_gads
+show_status
