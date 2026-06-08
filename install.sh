@@ -25,7 +25,7 @@ MONGO_DSN="${MONGO_DSN:-localhost:${MONGO_PORT}}"
 
 # Provider settings
 PROVIDER_NICKNAME="${PROVIDER_NICKNAME:-pi-provider}"
-PROVIDER_HUB="${PROVIDER_HUB:-http://192.168.1.7:10000}"
+PROVIDER_HUB="${PROVIDER_HUB:-http://0.0.0.0:10000}"
 
 # Colors
 RED='\033[0;31m'
