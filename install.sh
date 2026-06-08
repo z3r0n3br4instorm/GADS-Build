@@ -131,6 +131,13 @@ extract_gads() {
 # 5. Create systemd services
 # ============================================================
 create_services() {
+  # Prompt for provider nickname
+  if [[ -t 0 ]]; then
+    echo ""
+    read -r -p "Enter provider nickname [${PROVIDER_NICKNAME}]: " input_nickname
+    PROVIDER_NICKNAME="${input_nickname:-$PROVIDER_NICKNAME}"
+  fi
+
   HUB_SERVICE="/etc/systemd/system/gads-hub.service"
   log "Creating $HUB_SERVICE"
 
