@@ -1,0 +1,17 @@
+[Unit]
+Description=GADS Rescue Service — log monitor and provider watchdog
+After=network.target gads-provider.service
+
+[Service]
+Type=simple
+User=xg
+WorkingDirectory=/home/xg/GADS-Build/GADSRescueService
+ExecStart=/usr/bin/python3 /home/xg/GADS-Build/GADSRescueService/rescueEngine.py
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gads-rescue
+
+[Install]
+WantedBy=multi-user.target
