@@ -107,7 +107,7 @@ start_mongodb() {
 # ============================================================
 stop_gads() {
   log "Stopping existing GADS services (if running)..."
-  sudo systemctl stop gads-hub gads-provider 2>/dev/null || true
+  sudo systemctl stop gads-hub gads-provider gads-software-update 2>/dev/null || true
 }
 
 # ============================================================
@@ -181,6 +181,30 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  UPDATE_SERVICE="/etc/systemd/system/gads-software-update.service"
+  log "Creating $UPDATE_SERVICE"
+
+  sudo tee "$UPDATE_SERVICE" > /dev/null <<EOF
+[Unit]
+Description=GADS Software Update Service — git remote watcher and service restarter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$GADS_USER
+WorkingDirectory=$GADS_DIR/../GADS-Build/GADSSoftwareUpdateService
+ExecStart=/usr/bin/python3 $GADS_DIR/../GADS-Build/GADSSoftwareUpdateService/softwareUpdateEngine.py
+Restart=on-failure
+RestartSec=15s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gads-software-update
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 # ============================================================
@@ -190,14 +214,16 @@ start_gads() {
   log "Reloading systemd daemon..."
   sudo systemctl daemon-reload
 
-  log "Enabling gads-hub and gads-provider..."
-  sudo systemctl enable gads-hub gads-provider
+  log "Enabling gads-hub, gads-provider and gads-software-update..."
+  sudo systemctl enable gads-hub gads-provider gads-software-update
 
   log "Starting gads-hub..."
   sudo systemctl start gads-hub
   sleep 5
   log "Starting gads-provider..."
   sudo systemctl start gads-provider
+  log "Starting gads-software-update..."
+  sudo systemctl start gads-software-update
 }
 
 # ============================================================
@@ -218,6 +244,9 @@ show_status() {
   echo ""
   log "Provider service status:"
   sudo systemctl status gads-provider --no-pager -l || true
+  echo ""
+  log "Software update service status:"
+  sudo systemctl status gads-software-update --no-pager -l || true
 
   echo ""
   log "Useful commands:"
@@ -225,8 +254,10 @@ show_status() {
   log "  sudo docker logs gads-mongodb           # MongoDB logs"
   log "  sudo systemctl status gads-hub"
   log "  sudo systemctl status gads-provider"
+  log "  sudo systemctl status gads-software-update"
   log "  sudo journalctl -u gads-hub -f"
   log "  sudo journalctl -u gads-provider -f"
+  log "  sudo journalctl -u gads-software-update -f"
 }
 
 # ============================================================

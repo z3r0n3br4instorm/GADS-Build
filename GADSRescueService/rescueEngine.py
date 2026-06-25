@@ -9,9 +9,11 @@ import collections
 import glob
 import json
 import os
+import re
 import select
 import subprocess
 import sys
+import threading
 import time
 import logging
 
@@ -22,6 +24,7 @@ TARGET_SERVICE  = "gads-provider.service"
 ERROR_THRESHOLD = 3     # number of errors that trigger a restart
 ERROR_WINDOW    = 300   # sliding window in seconds (5 minutes)
 COOLDOWN_SECS   = 120   # minimum seconds between restarts after threshold hit
+USB_CHECK_INTERVAL = 30  # seconds between USB debugging-mode polls
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -85,7 +88,6 @@ def check_usb_debug_devices():
       5. For each USB serial: if it appears as 'offline' in adb, restart the
          adb server.
     """
-    import re
 
     log.info("[USB] Scanning for devices in debugging mode ...")
 
@@ -205,6 +207,18 @@ def check_usb_debug_devices():
         log.info("[USB] All detected USB devices are online in ADB.")
 
 
+def _usb_watcher_loop(stop_event: threading.Event):
+    """Background thread: polls check_usb_debug_devices() every USB_CHECK_INTERVAL seconds."""
+    log.info("[USB] Watcher thread started — polling every %ds.", USB_CHECK_INTERVAL)
+    while not stop_event.is_set():
+        try:
+            check_usb_debug_devices()
+        except Exception as exc:
+            log.error("[USB] Watcher loop error: %s", exc)
+        stop_event.wait(USB_CHECK_INTERVAL)
+    log.info("[USB] Watcher thread stopped.")
+
+
 def tail_files(paths: list[str]):
     """
     Open tail -F processes for all given paths and yield (path, line) tuples.
@@ -249,8 +263,12 @@ def main():
         TARGET_SERVICE, ERROR_THRESHOLD, ERROR_WINDOW, COOLDOWN_SECS,
     )
 
-    # Run an initial USB debug device check on startup
-    check_usb_debug_devices()
+    # Start the USB debug-device watcher in a daemon background thread
+    stop_usb = threading.Event()
+    usb_thread = threading.Thread(
+        target=_usb_watcher_loop, args=(stop_usb,), daemon=True, name="usb-watcher"
+    )
+    usb_thread.start()
 
     log_files = find_log_files()
     if not log_files:

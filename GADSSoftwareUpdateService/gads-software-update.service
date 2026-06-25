@@ -1,0 +1,18 @@
+[Unit]
+Description=GADS Software Update Service — git remote watcher and service restarter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xg
+WorkingDirectory=/home/xg/GADS-Build/GADSSoftwareUpdateService
+ExecStart=/usr/bin/python3 /home/xg/GADS-Build/GADSSoftwareUpdateService/softwareUpdateEngine.py
+Restart=on-failure
+RestartSec=15s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gads-software-update
+
+[Install]
+WantedBy=multi-user.target
