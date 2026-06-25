@@ -71,6 +71,140 @@ def restart_service(service: str):
         )
 
 
+
+def check_usb_debug_devices():
+    """
+    Detect all USB devices currently in Android debugging mode, resolve their
+    ADB serials, and restart the ADB server if any connected device is offline.
+
+    Steps:
+      1. Run `lsusb` and find all lines containing '(debugging mode)'.
+      2. Extract the unique VID:PID from each such line automatically.
+      3. For each VID:PID run `sudo lsusb -v -d <VID:PID>` to get iSerial values.
+      4. Run `adb devices` and build a serial -> status map.
+      5. For each USB serial: if it appears as 'offline' in adb, restart the
+         adb server.
+    """
+    import re
+
+    log.info("[USB] Scanning for devices in debugging mode ...")
+
+    # ── Step 1: find all lsusb lines that mention '(debugging mode)' ──────────
+    try:
+        lsusb_out = subprocess.run(
+            ["lsusb"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as exc:
+        log.error("[USB] lsusb failed: %s", exc)
+        return
+
+    debug_lines = [
+        line for line in lsusb_out.stdout.splitlines()
+        if "debugging mode" in line.lower()
+    ]
+
+    if not debug_lines:
+        log.info("[USB] No devices in debugging mode detected.")
+        return
+
+    log.info("[USB] Found %d device(s) in debugging mode:", len(debug_lines))
+    for dl in debug_lines:
+        log.info("[USB]   %s", dl.strip())
+
+    # ── Step 2: extract unique VID:PID values from those lines ────────────────
+    # lsusb format: "Bus 001 Device 035: ID 04e8:6866 Samsung ..."
+    vid_pids: set[str] = set()
+    for line in debug_lines:
+        match = re.search(r"ID\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4})", line)
+        if match:
+            vid_pids.add(match.group(1))
+
+    if not vid_pids:
+        log.warning("[USB] Could not parse VID:PID from lsusb output.")
+        return
+
+    log.info("[USB] Detected VID:PID(s): %s", sorted(vid_pids))
+
+    # ── Step 3: get iSerial for every discovered VID:PID ──────────────────────
+    usb_serials: list[str] = []
+    for vid_pid in sorted(vid_pids):
+        try:
+            verbose_out = subprocess.run(
+                ["sudo", "lsusb", "-v", "-d", vid_pid],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as exc:
+            log.error("[USB] verbose lsusb for %s failed: %s", vid_pid, exc)
+            continue
+
+        for line in verbose_out.stdout.splitlines():
+            if "iserial" in line.lower():
+                # "  iSerial   3 RFCY809VA8W"
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    usb_serials.append(parts[2])
+
+    if not usb_serials:
+        log.warning("[USB] Could not parse any serials from verbose lsusb output.")
+        return
+
+    log.info("[USB] Serials detected via lsusb: %s", usb_serials)
+
+    # ── Step 4: query adb devices ─────────────────────────────────────────────
+    try:
+        adb_out = subprocess.run(
+            ["adb", "devices"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as exc:
+        log.error("[USB] `adb devices` failed: %s", exc)
+        return
+
+    # Build serial -> status map; lines: "RFCY809VA8W\tdevice" / "...\toffline"
+    adb_status: dict[str, str] = {}
+    for line in adb_out.stdout.splitlines()[1:]:  # skip header
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            adb_status[parts[0]] = parts[1]
+
+    log.info("[USB] ADB device statuses: %s", adb_status)
+
+    # ── Step 5: check for offline devices and restart adb if needed ───────────
+    offline_found = False
+    for serial in usb_serials:
+        status = adb_status.get(serial, "not found")
+        log.info("[USB] Serial %s -> adb status: %s", serial, status)
+        if status == "offline":
+            log.warning(
+                "[USB] Device %s is connected via USB but offline in ADB.",
+                serial,
+            )
+            offline_found = True
+
+    if offline_found:
+        log.warning("[USB] Offline device(s) detected — restarting ADB server.")
+        try:
+            kill_result = subprocess.run(
+                ["adb", "kill-server"],
+                capture_output=True, text=True, timeout=10,
+            )
+            log.info("[USB] adb kill-server: %s", kill_result.stdout.strip() or "ok")
+
+            start_result = subprocess.run(
+                ["adb", "start-server"],
+                capture_output=True, text=True, timeout=15,
+            )
+            log.info("[USB] adb start-server: %s", start_result.stdout.strip() or "ok")
+        except Exception as exc:
+            log.error("[USB] Failed to restart ADB server: %s", exc)
+    else:
+        log.info("[USB] All detected USB devices are online in ADB.")
+
+
 def tail_files(paths: list[str]):
     """
     Open tail -F processes for all given paths and yield (path, line) tuples.
@@ -114,6 +248,9 @@ def main():
         "Target service: %s | Threshold: %d errors in %ds | Cooldown: %ds",
         TARGET_SERVICE, ERROR_THRESHOLD, ERROR_WINDOW, COOLDOWN_SECS,
     )
+
+    # Run an initial USB debug device check on startup
+    check_usb_debug_devices()
 
     log_files = find_log_files()
     if not log_files:
