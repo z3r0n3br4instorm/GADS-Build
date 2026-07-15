@@ -1,0 +1,38 @@
+services:
+  # ---------------------------------------------------------------------------
+  # SSO Proxy — authenticates users against Auth0, mints GADS JWTs
+  # ---------------------------------------------------------------------------
+  gads-sso-proxy:
+    build: .
+    container_name: gads-sso-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - gads-net
+    expose:
+      - "5050"
+
+  # ---------------------------------------------------------------------------
+  # nginx — reverse proxy that enforces SSO on every request to GADS
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: gads-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach GADS on the host
+    volumes:
+      - ./nginx-gads.conf:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      - gads-sso-proxy
+    networks:
+      - gads-net
+
+networks:
+  gads-net:
+    driver: bridge
