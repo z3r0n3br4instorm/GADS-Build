@@ -25,7 +25,8 @@ GADS_TOKEN_TTL_SECONDS = int(os.environ.get("GADS_TOKEN_TTL_SECONDS", "300"))
 GADS_DEFAULT_ROLE = os.environ.get("GADS_DEFAULT_ROLE", "user")
 GADS_ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("GADS_ADMIN_EMAILS", "").split(",") if e.strip()}
 GADS_PORT = os.environ.get("GADS_PORT", "10000")
-GADS_DEFAULT_SECRET = "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo="
+GADS_DEFAULT_SECRET = os.environ.get("GADS_DEFAULT_SECRET", "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo=")
+GADS_DEFAULT_TENANT = os.environ.get("GADS_DEFAULT_TENANT", "5qnpXIGzC4Rqk_wb5DIYLKFBkfhLwtZ72ZUZlkQvO5A=")
 
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
@@ -58,7 +59,7 @@ def mint_gads_jwt(email):
         "exp": int((now + timedelta(hours=1)).timestamp()),
         "iat": int(now.timestamp()),
         "username": email, "role": role, "scope": scopes,
-        "tenant": "5qnpXIGzC4Rqk_wb5DIYLKFBkfhLwtZ72ZUZlkQvO5A=",
+        "tenant": GADS_DEFAULT_TENANT,
     }
     return pyjwt.encode(payload, GADS_DEFAULT_SECRET, algorithm="HS256")
 

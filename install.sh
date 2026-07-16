@@ -215,6 +215,10 @@ GADS_ADMIN_EMAILS=$GADS_ADMIN_EMAILS
 
 GADS_PORT=$GADS_PORT
 NGINX_PORT=$NGINX_PORT
+
+# GADS built-in defaults (auto-retrieved after GADS first startup — see post-install steps)
+GADS_DEFAULT_SECRET=
+GADS_DEFAULT_TENANT=
 EOF
     fi
   else
@@ -343,6 +347,17 @@ start_gads() {
   log "Starting gads-hub..."
   sudo systemctl start gads-hub
   sleep 5
+
+  log "Retrieving GADS default secret from MongoDB..."
+  GADS_DEFAULT_KEY=$(sudo docker exec "$MONGO_CONTAINER" mongosh --quiet --eval "db = db.getSiblingDB('gads'); print(db.secret_keys.findOne({is_default: true}).key)" 2>/dev/null || echo "")
+  if [ -n "$GADS_DEFAULT_KEY" ] && [ "$GADS_DEFAULT_KEY" != "null" ]; then
+    log "  Default key retrieved: ${GADS_DEFAULT_KEY:0:20}..."
+    sudo sed -i "s|^GADS_DEFAULT_SECRET=.*|GADS_DEFAULT_SECRET=$GADS_DEFAULT_KEY|" "$GADSAUTH_DIR/.env"
+    log "  Updated GADS_DEFAULT_SECRET in .env"
+  else
+    warn "  Could not retrieve default key. Run the post-install command below once GADS is running."
+  fi
+
   log "Starting gads-provider..."
   sudo systemctl start gads-provider
   sleep 2
@@ -392,6 +407,26 @@ show_status() {
   log ""
   log "To reconfigure SSO:  edit $GADSAUTH_DIR/.env then run:"
   log "  cd $GADSAUTH_DIR && docker compose up -d --build"
+  echo ""
+  log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log "  Post-install: Retrieve GADS default secret"
+  log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log ""
+  log "GADS auto-generates a default signing key on first startup."
+  log "If the installer could not auto-retrieve it (or for new installs),"
+  log "run these commands to populate GADS_DEFAULT_SECRET in your .env:"
+  echo ""
+  echo "  # 1. Get the default key from MongoDB:"
+  echo "  docker exec $MONGO_CONTAINER mongosh --quiet --eval \\"
+  echo "    \"db.getSiblingDB('gads').secret_keys.findOne({is_default: true}).key\""
+  echo ""
+  echo "  # 2. Add it to your .env:"
+  echo "  echo \"GADS_DEFAULT_SECRET=<key-from-step-1>\" >> $GADSAUTH_DIR/.env"
+  echo ""
+  echo "  # 3. Rebuild the SSO proxy:"
+  echo "  cd $GADSAUTH_DIR && docker compose up -d --build"
+  echo ""
+  log "Skip this if GADS_DEFAULT_SECRET is already set in .env."
 }
 
 # ============================================================
