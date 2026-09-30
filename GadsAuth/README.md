@@ -563,11 +563,13 @@ Matches any URL not caught by a more specific route. With the current nginx conf
 1. User visits any protected URL → nginx issues `auth_request` to `/auth/verify`
 2. No valid session → 401 → nginx `@force_login` redirects to `/auth/login?redirect=<original_url>`
 3. `/auth/login` clears any stale session, stores the redirect target, redirects to Auth0 `/authorize`
-4. User authenticates with Auth0 (Google, etc.)
+4. User authenticates with Auth0 (Google, username/password, etc.)
 5. Auth0 redirects to `/auth/callback?code=...&state=...`
-6. Callback exchanges the code for tokens, extracts email from `userinfo`, creates session
-7. Redirects user to the stored `post_login_redirect` URL (or `/`)
-8. nginx auth_request now passes → proxies to GADS hub with bearer JWT
+6. Callback exchanges code for tokens, extracts email from `userinfo`, creates session
+7. **Auto-creates user in GADS (MongoDB)**: `ensure_gads_user` checks MongoDB's `users` collection. If the user doesn't exist, it automatically creates a new document with an empty password, appropriate role, and assigns the default workspace.
+8. **Auto-logs into GADS UI**: Callback serves an HTML page that stores `accessToken`, `username`, `userRole`, and `tenant` in `localStorage`, then navigates to destination.
+9. GADS React app mounts, reads `localStorage.getItem("accessToken")`, validates with `/user-info` (200 OK), and renders the Devices dashboard without ever prompting for GADS login credentials!
+10. Nginx `sub_filter` also acts as a safety net on all HTML page requests, auto-restoring `localStorage` tokens if they are ever missing while the SSO session is active.
 
 ### Authenticated Requests
 

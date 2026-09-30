@@ -308,6 +308,59 @@ def proxy_to_gads(path):
 
 # --- Auth routes ---
 
+def ensure_gads_user(email):
+    """Ensure that the authenticated user exists in MongoDB 'users' collection."""
+    if not email:
+        return GADS_DEFAULT_ROLE
+    db = get_mongo_db()
+    role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
+    if db is None:
+        log.warning("Cannot ensure GADS user in MongoDB: database connection unavailable")
+        return role
+
+    try:
+        user_col = db["users"]
+        user = user_col.find_one({"username": email})
+
+        # Retrieve default workspace ID if user is not admin
+        workspace_ids = None
+        if role != "admin":
+            workspaces_col = db["workspaces"]
+            default_ws = workspaces_col.find_one({"is_default": True})
+            if not default_ws:
+                default_ws = workspaces_col.find_one()
+            if default_ws:
+                workspace_ids = [str(default_ws["_id"])]
+            else:
+                workspace_ids = []
+
+        if user is None:
+            user_doc = {
+                "username": email,
+                "password": "",  # Empty password for SSO users
+                "role": role,
+                "workspace_ids": workspace_ids,
+            }
+            user_col.insert_one(user_doc)
+            log.info("Auto-created GADS user in MongoDB: '%s' (role: %s, workspaces: %s)", email, role, workspace_ids)
+        else:
+            # Sync user role or workspaces if empty
+            updates = {}
+            if email in GADS_ADMIN_EMAILS and user.get("role") != "admin":
+                updates["role"] = "admin"
+                updates["workspace_ids"] = None
+            elif role != "admin" and not user.get("workspace_ids"):
+                if workspace_ids:
+                    updates["workspace_ids"] = workspace_ids
+            if updates:
+                user_col.update_one({"_id": user["_id"]}, {"$set": updates})
+                log.info("Updated GADS user '%s' in MongoDB: %s", email, updates)
+            role = user.get("role", role)
+        return role
+    except Exception as e:
+        log.error("Failed to ensure GADS user '%s' in MongoDB: %s", email, e)
+        return role
+
 @app.route("/auth/login")
 def login():
     session.clear()
@@ -332,13 +385,49 @@ def callback():
     if not email:
         log.warning("No email found in userinfo: %s", userinfo)
         return jsonify({"error": "no_email"}), 400
+
     session.permanent = True
     session["user_email"] = email
     session["user_name"] = userinfo.get("name", email)
     session["authenticated_at"] = int(time.time())
     dest = session.pop("post_login_redirect", POST_LOGIN_DEFAULT)
-    log.info("Successfully authenticated user '%s', redirecting to '%s'", email, dest)
-    return redirect(dest)
+
+    # 1. Auto-create or sync user in GADS MongoDB
+    role = ensure_gads_user(email)
+
+    # 2. Mint GADS JWT token and fetch tenant info for React app
+    gadstoken = mint_gads_jwt(email)
+    secret, tenant = get_default_signing_info()
+
+    log.info("Successfully authenticated user '%s' (role: %s), auto-logging into GADS and redirecting to '%s'", email, role, dest)
+
+    # 3. Return HTML page that initializes localStorage before redirecting to GADS SPA
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Signing in to GADS...</title>
+</head>
+<body>
+    <script>
+        try {{
+            localStorage.setItem("accessToken", {json.dumps(gadstoken)});
+            localStorage.setItem("username", {json.dumps(email)});
+            localStorage.setItem("userRole", {json.dumps(role)});
+            if ({json.dumps(tenant)}) {{
+                localStorage.setItem("tenant", {json.dumps(tenant)});
+            }}
+        }} catch (e) {{
+            console.error("Failed to set localStorage", e);
+        }}
+        window.location.replace({json.dumps(dest)});
+    </script>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; margin-top: 60px; color: #444;">
+        Logging in to GADS...
+    </p>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 @app.route("/auth/logout")
 def logout():
@@ -361,9 +450,18 @@ def verify():
     email = session.get("user_email")
     if not email:
         return jsonify({"error": "not_authenticated"}), 401
-    token = mint_origin_jwt(email)
+
+    role = ensure_gads_user(email)
+    origin_token = mint_origin_jwt(email)
+    react_token = mint_gads_jwt(email)
+    secret, tenant = get_default_signing_info()
+
     resp = make_response("", 200)
-    resp.headers["X-GADS-Auth-Token"] = token
+    resp.headers["X-GADS-Auth-Token"] = origin_token
+    resp.headers["X-GADS-React-Token"] = react_token
+    resp.headers["X-GADS-User"] = email
+    resp.headers["X-GADS-Role"] = role
+    resp.headers["X-GADS-Tenant"] = tenant or ""
     return resp
 
 @app.route("/healthz")
@@ -379,13 +477,19 @@ def authenticate():
                                    headers={"Host": request.host},
                                    data=request.get_data(), timeout=30)
         return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "text/html"))
+    role = ensure_gads_user(email)
     gadstoken = mint_gads_jwt(email)
-    role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
+    secret, tenant = get_default_signing_info()
     return jsonify({
         "success": True, "message": "",
         "result": {
-            "accessToken": gadstoken, "token_type": "Bearer",
-            "expires_in": 3600, "username": email, "role": role,
+            "access_token": gadstoken,
+            "accessToken": gadstoken,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "username": email,
+            "role": role,
+            "tenant": tenant or "",
         }
     })
 
