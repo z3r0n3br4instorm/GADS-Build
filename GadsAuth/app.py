@@ -318,19 +318,26 @@ def login():
 
 @app.route("/auth/callback")
 def callback():
-    redirect_uri = get_redirect_uri()
-    token = auth0.authorize_access_token(redirect_uri=redirect_uri)
+    try:
+        token = auth0.authorize_access_token()
+    except Exception as e:
+        log.error("Auth0 token exchange failed: %s", e, exc_info=True)
+        return jsonify({"error": "authentication_failed", "details": str(e)}), 400
+
     userinfo = token.get("userinfo")
     if not userinfo:
+        log.warning("No userinfo returned in token: %s", token)
         return jsonify({"error": "no_userinfo"}), 400
     email = (userinfo.get("email") or "").lower()
     if not email:
+        log.warning("No email found in userinfo: %s", userinfo)
         return jsonify({"error": "no_email"}), 400
     session.permanent = True
     session["user_email"] = email
     session["user_name"] = userinfo.get("name", email)
     session["authenticated_at"] = int(time.time())
     dest = session.pop("post_login_redirect", POST_LOGIN_DEFAULT)
+    log.info("Successfully authenticated user '%s', redirecting to '%s'", email, dest)
     return redirect(dest)
 
 @app.route("/auth/logout")

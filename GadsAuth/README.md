@@ -402,8 +402,12 @@ Called when nginx's `@force_login` redirects an unauthenticated user here, or wh
 ```python
 @app.route("/auth/callback")
 def callback():
-    redirect_uri = get_redirect_uri()
-    token = auth0.authorize_access_token(redirect_uri=redirect_uri)
+    try:
+        token = auth0.authorize_access_token()
+    except Exception as e:
+        log.error("Auth0 token exchange failed: %s", e, exc_info=True)
+        return jsonify({"error": "authentication_failed", "details": str(e)}), 400
+
     userinfo = token.get("userinfo")
     if not userinfo:
         return jsonify({"error": "no_userinfo"}), 400
@@ -420,7 +424,7 @@ def callback():
 
 The URL Auth0 redirects to after the user authenticates. The query string contains `?code=...&state=...`.
 
-1. **`authorize_access_token(redirect_uri=redirect_uri)`** — authlib exchanges the authorization `code` for tokens (access token + id_token) using the matching dynamic redirect URI. It validates the `state` parameter against what was stored in the session (CSRF protection), validates the `nonce` (replay protection), and fetches `userinfo`.
+1. **`authorize_access_token()`** — authlib exchanges the authorization `code` for tokens (access token + id_token) using the redirect URI saved in the session's state. It validates the `state` parameter against what was stored in the session (CSRF protection), validates the `nonce` (replay protection), and fetches `userinfo`.
 2. **Extracts email** — the user's verified email from Auth0 becomes their GADS identity. Lowercased for consistency with `GADS_ADMIN_EMAILS`.
 3. **Creates the session** — `session.permanent = True` activates the 10-hour lifetime. Stores email, display name, and authentication timestamp.
 4. **Redirects** — pops the stored redirect target (consuming it so it's not reused) and sends the user there. Defaults to `/`.
