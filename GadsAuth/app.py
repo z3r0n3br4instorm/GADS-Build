@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 load_dotenv()
 import jwt as pyjwt
+import pymongo
 from authlib.integrations.flask_client import OAuth
 from flask import Flask, request, redirect, session, jsonify, make_response, Response
 
@@ -16,8 +17,8 @@ AUTH0_CLIENT_ID = os.environ["AUTH0_CLIENT_ID"]
 AUTH0_CLIENT_SECRET = os.environ["AUTH0_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
 POST_LOGIN_DEFAULT = os.environ.get("POST_LOGIN_DEFAULT", "/")
-GADS_ORIGIN = os.environ["GADS_ORIGIN"]
-GADS_JWT_SECRET = os.environ["GADS_JWT_SECRET"]
+GADS_ORIGIN = os.environ.get("GADS_ORIGIN", "sso.assurecraft.com")
+GADS_JWT_SECRET = os.environ.get("GADS_JWT_SECRET", "")
 GADS_USER_CLAIM = os.environ.get("GADS_USER_CLAIM", "username")
 GADS_TENANT_CLAIM = os.environ.get("GADS_TENANT_CLAIM", "tenant")
 GADS_TENANT_VALUE = os.environ.get("GADS_TENANT_VALUE", "assurecraft")
@@ -25,14 +26,23 @@ GADS_TOKEN_TTL_SECONDS = int(os.environ.get("GADS_TOKEN_TTL_SECONDS", "300"))
 GADS_DEFAULT_ROLE = os.environ.get("GADS_DEFAULT_ROLE", "user")
 GADS_ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("GADS_ADMIN_EMAILS", "").split(",") if e.strip()}
 GADS_PORT = os.environ.get("GADS_PORT", "10000")
-GADS_DEFAULT_SECRET = os.environ.get("GADS_DEFAULT_SECRET", "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo=")
-GADS_DEFAULT_TENANT = os.environ.get("GADS_DEFAULT_TENANT", "5qnpXIGzC4Rqk_wb5DIYLKFBkfhLwtZ72ZUZlkQvO5A=")
+GADS_DEFAULT_SECRET = os.environ.get("GADS_DEFAULT_SECRET", "")
+GADS_DEFAULT_TENANT = os.environ.get("GADS_DEFAULT_TENANT", "")
+MONGO_URI = os.environ.get("MONGO_URI")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "gads")
+
+# Secure cookies only over HTTPS, or when explicitly requested via env var
+cookie_secure_env = os.environ.get("SESSION_COOKIE_SECURE")
+if cookie_secure_env is not None:
+    SESSION_COOKIE_SECURE = cookie_secure_env.lower() in ("true", "1", "yes")
+else:
+    SESSION_COOKIE_SECURE = REDIRECT_URI.startswith("https://")
 
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
     SESSION_COOKIE_NAME="gads_sso_session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=10),
 )
@@ -49,33 +59,201 @@ auth0 = oauth.register(
     client_kwargs={"scope": "openid profile email"},
 )
 
+# --- MongoDB secret retrieval & caching ---
+_mongo_client = None
+_key_cache = {}
+_key_cache_time = 0
+
+def decode_http_body(raw_bytes):
+    if b"\r\n\r\n" not in raw_bytes:
+        return 0, b""
+    head, body = raw_bytes.split(b"\r\n\r\n", 1)
+    status = int(head.split(b"\r\n")[0].split(b" ")[1])
+    if b"chunked" in head.lower():
+        result = b""
+        while body:
+            line_end = body.find(b"\r\n")
+            if line_end == -1:
+                break
+            chunk_len_str = body[:line_end].strip().split(b";")[0]
+            if not chunk_len_str:
+                body = body[line_end + 2:]
+                continue
+            try:
+                chunk_len = int(chunk_len_str, 16)
+            except ValueError:
+                break
+            if chunk_len == 0:
+                break
+            start = line_end + 2
+            end = start + chunk_len
+            result += body[start:end]
+            body = body[end + 2:]
+        return status, result
+    return status, body
+
+def discover_mongo_ips_from_docker(container_name="gads-mongodb"):
+    """Discover MongoDB container IPs via local docker socket if mounted."""
+    sock_path = "/var/run/docker.sock"
+    if not os.path.exists(sock_path):
+        return []
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(sock_path)
+        req = (
+            f"GET /containers/{container_name}/json HTTP/1.1\r\n"
+            f"Host: localhost\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("latin1")
+        s.sendall(req)
+        chunks = []
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+        s.close()
+        status, body = decode_http_body(b"".join(chunks))
+        if status == 200 and body:
+            info = json.loads(body.decode("utf-8"))
+            networks = info.get("NetworkSettings", {}).get("Networks", {})
+            return [cfg.get("IPAddress") for cfg in networks.values() if cfg.get("IPAddress")]
+    except Exception as e:
+        log.debug("Docker socket discovery failed: %s", e)
+    return []
+
+def get_mongo_db():
+    """Connect to MongoDB using candidate hostnames/URIs."""
+    global _mongo_client
+    if _mongo_client is not None:
+        try:
+            _mongo_client.admin.command("ping")
+            return _mongo_client[MONGO_DB_NAME]
+        except Exception:
+            _mongo_client = None
+
+    uris = []
+    if MONGO_URI:
+        uris.append(MONGO_URI)
+    uris.append(f"mongodb://{os.environ.get('MONGO_HOST', 'gads-mongodb')}:{os.environ.get('MONGO_PORT', '27017')}")
+    for ip in discover_mongo_ips_from_docker():
+        uris.append(f"mongodb://{ip}:{os.environ.get('MONGO_PORT', '27017')}")
+    uris.extend([
+        "mongodb://localhost:27017",
+        "mongodb://host.docker.internal:27017",
+        "mongodb://127.0.0.1:27017",
+    ])
+
+    for uri in uris:
+        try:
+            client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=1500)
+            client.admin.command("ping")
+            log.info("Connected to MongoDB at %s", uri)
+            _mongo_client = client
+            return client[MONGO_DB_NAME]
+        except Exception as e:
+            log.debug("MongoDB connection attempt to %s failed: %s", uri, e)
+            continue
+    log.warning("Could not connect to MongoDB on any known candidate URI.")
+    return None
+
+def refresh_mongo_keys():
+    """Fetch secret keys from MongoDB secret_keys collection (cached for 60s)."""
+    global _key_cache, _key_cache_time
+    now = time.time()
+    if _key_cache and (now - _key_cache_time < 60):
+        return _key_cache
+
+    db = get_mongo_db()
+    if db is None:
+        return _key_cache
+
+    try:
+        keys_col = db["secret_keys"]
+        origin_doc = keys_col.find_one({"origin": GADS_ORIGIN, "disabled": {"$ne": True}})
+        default_doc = keys_col.find_one({"is_default": True, "disabled": {"$ne": True}})
+
+        cache = {}
+        if origin_doc:
+            cache["origin_secret"] = origin_doc.get("key")
+            cache["user_claim"] = origin_doc.get("user_identifier_claim")
+            cache["tenant_claim"] = origin_doc.get("tenant_identifier_claim")
+            log.info("Loaded secret key for origin '%s' from MongoDB", GADS_ORIGIN)
+        else:
+            log.warning("No active secret key found in MongoDB for origin '%s'", GADS_ORIGIN)
+
+        if default_doc:
+            cache["default_secret"] = default_doc.get("key")
+            cache["default_tenant"] = default_doc.get("tenant")
+            log.info("Loaded default secret key from MongoDB")
+
+        _key_cache = cache
+        _key_cache_time = now
+        return _key_cache
+    except Exception as e:
+        log.error("Failed to query secret keys from MongoDB: %s", e)
+        return _key_cache
+
+def get_origin_signing_info():
+    """Resolve origin signing secret and claims, prioritizing MongoDB with env fallback."""
+    keys = refresh_mongo_keys()
+    secret = (
+        keys.get("origin_secret")
+        or (GADS_JWT_SECRET if GADS_JWT_SECRET else None)
+        or keys.get("default_secret")
+        or (GADS_DEFAULT_SECRET if GADS_DEFAULT_SECRET else None)
+        or "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo="
+    )
+    user_claim = keys.get("user_claim") or GADS_USER_CLAIM
+    tenant_claim = keys.get("tenant_claim") or GADS_TENANT_CLAIM
+    tenant_val = GADS_TENANT_VALUE
+    return secret, user_claim, tenant_claim, tenant_val
+
+def get_default_signing_info():
+    """Resolve default signing secret and tenant, prioritizing MongoDB with env fallback."""
+    keys = refresh_mongo_keys()
+    secret = (
+        keys.get("default_secret")
+        or (GADS_DEFAULT_SECRET if GADS_DEFAULT_SECRET else None)
+        or "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo="
+    )
+    tenant = (
+        keys.get("default_tenant")
+        or (GADS_DEFAULT_TENANT if GADS_DEFAULT_TENANT else None)
+        or "5qnpXIGzC4Rqk_wb5DIYLKFBkfhLwtZ72ZUZlkQvO5A="
+    )
+    return secret, tenant
+
 def mint_gads_jwt(email):
     """Mint a GADS-compatible JWT (for the React frontend to store)."""
     now = datetime.now(timezone.utc)
     role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
     scopes = ["user", "admin"] if role == "admin" else ["user"]
+    secret, tenant = get_default_signing_info()
     payload = {
         "iss": "gads", "sub": email,
         "exp": int((now + timedelta(hours=1)).timestamp()),
         "iat": int(now.timestamp()),
         "username": email, "role": role, "scope": scopes,
-        "tenant": GADS_DEFAULT_TENANT,
+        "tenant": tenant,
     }
-    return pyjwt.encode(payload, GADS_DEFAULT_SECRET, algorithm="HS256")
+    return pyjwt.encode(payload, secret, algorithm="HS256")
 
 def mint_origin_jwt(email):
     """Mint an origin-based JWT (for server-to-server with GADS)."""
     now = datetime.now(timezone.utc)
     role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
+    secret, user_claim, tenant_claim, tenant_val = get_origin_signing_info()
     payload = {
         "sub": email, "username": email, "role": role, "scope": [role],
-        "tenant": GADS_TENANT_VALUE,
+        "tenant": tenant_val,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=GADS_TOKEN_TTL_SECONDS)).timestamp()),
         "iss": "gads-sso-proxy", "origin": GADS_ORIGIN,
-        GADS_USER_CLAIM: email, GADS_TENANT_CLAIM: GADS_TENANT_VALUE,
+        user_claim: email, tenant_claim: tenant_val,
     }
-    return pyjwt.encode(payload, GADS_JWT_SECRET, algorithm="HS256")
+    return pyjwt.encode(payload, secret, algorithm="HS256")
 
 def proxy_to_gads(path):
     email = session.get("user_email")
@@ -175,7 +353,7 @@ def authenticate():
 def legacy_login():
     session.clear()
     resp = make_response(redirect("/"))
-    resp.set_cookie("gads_legacy", "1", max_age=3600, httponly=True, secure=True, samesite="Lax")
+    resp.set_cookie("gads_legacy", "1", max_age=3600, httponly=True, secure=SESSION_COOKIE_SECURE, samesite="Lax")
     return resp
 
 # Catch-all: proxy to GADS with JWT injection

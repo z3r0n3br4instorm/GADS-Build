@@ -8,8 +8,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - gads-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     expose:
       - "5050"
 
@@ -35,4 +39,6 @@ services:
 
 networks:
   gads-net:
+    name: gads-net
     driver: bridge
+
