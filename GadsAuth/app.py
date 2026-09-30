@@ -188,7 +188,7 @@ def get_mongo_db():
     return None
 
 def refresh_mongo_keys():
-    """Fetch secret keys from MongoDB secret_keys collection (cached for 60s)."""
+    """Fetch secret keys and default workspace tenant from MongoDB (cached for 60s)."""
     global _key_cache, _key_cache_time
     now = time.time()
     if _key_cache and (now - _key_cache_time < 60):
@@ -214,29 +214,39 @@ def refresh_mongo_keys():
 
         if default_doc:
             cache["default_secret"] = default_doc.get("key")
-            cache["default_tenant"] = default_doc.get("tenant")
             log.info("Loaded default secret key from MongoDB")
+
+        # Dynamically load default tenant from workspaces collection
+        ws_col = db["workspaces"]
+        default_ws = ws_col.find_one({"is_default": True}) or ws_col.find_one()
+        if default_ws and default_ws.get("tenant"):
+            cache["default_tenant"] = default_ws["tenant"]
+            log.info("Loaded default workspace tenant from MongoDB: %s", default_ws["tenant"])
 
         _key_cache = cache
         _key_cache_time = now
         return _key_cache
     except Exception as e:
-        log.error("Failed to query secret keys from MongoDB: %s", e)
+        log.error("Failed to query secret keys/tenant from MongoDB: %s", e)
         return _key_cache
 
 def get_origin_signing_info():
-    """Resolve origin signing secret and claims, prioritizing MongoDB with env fallback."""
+    """Resolve origin signing secret and claims, prioritizing MongoDB default with fallback."""
     keys = refresh_mongo_keys()
     secret = (
-        keys.get("origin_secret")
-        or (GADS_JWT_SECRET if GADS_JWT_SECRET else None)
-        or keys.get("default_secret")
+        keys.get("default_secret")
         or (GADS_DEFAULT_SECRET if GADS_DEFAULT_SECRET else None)
+        or keys.get("origin_secret")
+        or (GADS_JWT_SECRET if GADS_JWT_SECRET else None)
         or "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo="
     )
     user_claim = keys.get("user_claim") or GADS_USER_CLAIM
     tenant_claim = keys.get("tenant_claim") or GADS_TENANT_CLAIM
-    tenant_val = GADS_TENANT_VALUE
+    tenant_val = (
+        keys.get("default_tenant")
+        or (GADS_DEFAULT_TENANT if GADS_DEFAULT_TENANT else None)
+        or GADS_TENANT_VALUE
+    )
     return secret, user_claim, tenant_claim, tenant_val
 
 def get_default_signing_info():
@@ -255,14 +265,14 @@ def get_default_signing_info():
     return secret, tenant
 
 def mint_gads_jwt(email):
-    """Mint a GADS-compatible JWT (for the React frontend to store)."""
+    """Mint a GADS-compatible JWT (for the React frontend to store and for proxying)."""
     now = datetime.now(timezone.utc)
     role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
     scopes = ["user", "admin"] if role == "admin" else ["user"]
     secret, tenant = get_default_signing_info()
     payload = {
         "iss": "gads", "sub": email,
-        "exp": int((now + timedelta(hours=1)).timestamp()),
+        "exp": int((now + timedelta(hours=12)).timestamp()),
         "iat": int(now.timestamp()),
         "username": email, "role": role, "scope": scopes,
         "tenant": tenant,
@@ -270,19 +280,8 @@ def mint_gads_jwt(email):
     return pyjwt.encode(payload, secret, algorithm="HS256")
 
 def mint_origin_jwt(email):
-    """Mint an origin-based JWT (for server-to-server with GADS)."""
-    now = datetime.now(timezone.utc)
-    role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
-    secret, user_claim, tenant_claim, tenant_val = get_origin_signing_info()
-    payload = {
-        "sub": email, "username": email, "role": role, "scope": [role],
-        "tenant": tenant_val,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(seconds=GADS_TOKEN_TTL_SECONDS)).timestamp()),
-        "iss": "gads-sso-proxy", "origin": GADS_ORIGIN,
-        user_claim: email, tenant_claim: tenant_val,
-    }
-    return pyjwt.encode(payload, secret, algorithm="HS256")
+    """Mint a JWT for GADS requests."""
+    return mint_gads_jwt(email)
 
 def proxy_to_gads(path):
     email = session.get("user_email")
@@ -301,8 +300,10 @@ def proxy_to_gads(path):
     body = resp.content
     if "text/html" in ct and b"</head>" in body:
         gadstoken = mint_gads_jwt(email)
-        # Always overwrite the token — no stale-token check
-        script = f'<script>localStorage.setItem("accessToken","{gadstoken}");localStorage.setItem("user","{email}");</script>'.encode()
+        role = ensure_gads_user(email)
+        secret, tenant = get_default_signing_info()
+        tenant_str = tenant or ""
+        script = f'<script>try{{localStorage.setItem("accessToken","{gadstoken}");localStorage.setItem("username","{email}");localStorage.setItem("userRole","{role}");if("{tenant_str}")localStorage.setItem("tenant","{tenant_str}");}}catch(e){{}}</script>'.encode()
         body = body.replace(b"</head>", script + b"</head>")
     return Response(body, status=resp.status_code, content_type=ct)
 
@@ -486,7 +487,7 @@ def authenticate():
             "access_token": gadstoken,
             "accessToken": gadstoken,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": 43200,
             "username": email,
             "role": role,
             "tenant": tenant or "",
