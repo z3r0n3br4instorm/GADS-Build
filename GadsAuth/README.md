@@ -19,6 +19,83 @@ Browser → Cloudflare (HTTPS) → nginx:80 → GADS hub:10000
 - **GADS Hub** — the GADS application (systemd service on the host)
 - **MongoDB** — GADS data store (Docker container)
 
+---
+
+## Auth0 Setup (The Only Configurations Required)
+
+To integrate GADS with Auth0, you only need to configure **one application** in the Auth0 Dashboard:
+
+### 1. Create Application
+- In **Auth0 Dashboard** → **Applications** → **Applications** → click **Create Application**.
+- Name: `GADS` (or any preferred name).
+- Application Type: **Regular Web Application**.
+
+### 2. Application Settings
+Navigate to the **Settings** tab and configure:
+
+| Field | Value | Notes |
+|-------|-------|-------|
+| **Allowed Callback URLs** | `https://<domain>/auth/callback,`<br>`http://<lan-ip>/auth/callback,`<br>`http://localhost/auth/callback` | Comma-separated list. Include your Cloudflare domain, LAN IP, and localhost to authenticate from anywhere. |
+| **Allowed Logout URLs** | `https://<domain>,`<br>`http://<lan-ip>,`<br>`http://localhost` | Comma-separated list matching your base URLs. |
+| **Allowed Web Origins** | `https://<domain>,`<br>`http://<lan-ip>,`<br>`http://localhost` | Comma-separated list matching your base URLs. |
+
+> **Example for a lab server:**
+> - **Allowed Callback URLs:** `https://xg-lab-2.assurecraft.com/auth/callback, http://192.168.1.253/auth/callback, http://localhost/auth/callback`
+> - **Allowed Logout URLs:** `https://xg-lab-2.assurecraft.com, http://192.168.1.253, http://localhost`
+> - **Allowed Web Origins:** `https://xg-lab-2.assurecraft.com, http://192.168.1.253, http://localhost`
+
+### 3. Copy Credentials to `.env`
+Copy the following 3 values from the **Basic Information** section:
+- **Domain** → `AUTH0_DOMAIN`
+- **Client ID** → `AUTH0_CLIENT_ID`
+- **Client Secret** → `AUTH0_CLIENT_SECRET`
+
+> [!NOTE]
+> **Nothing else is required in Auth0!**
+> - You do **NOT** need custom Auth0 APIs, Actions, Rules, or Custom Audiences.
+> - Default social connections (e.g. Google) or Database username/password work out of the box.
+
+---
+
+## Cloudflare Tunnel Configuration
+
+If accessing GADS through a Cloudflare Zero Trust Tunnel:
+
+1. **Point the tunnel service to port 80 (nginx), NOT port 10000:**
+   ```yaml
+   ingress:
+     - hostname: xg-lab-2.assurecraft.com
+       service: http://localhost:80
+     - service: http_status:404
+   ```
+   > [!CAUTION]
+   > Do **NOT** route Cloudflare Tunnel directly to `http://localhost:10000`. Port 10000 is GADS Hub directly, which completely bypasses the Nginx reverse proxy and SSO authentication!
+
+2. **How header forwarding works:**
+   - Cloudflare terminates HTTPS at the edge and forwards requests to local nginx on port 80.
+   - Nginx forwards `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto`, and `Cf-Visitor` headers to the SSO Proxy.
+   - The SSO proxy dynamically detects whether incoming traffic is HTTPS or plain HTTP and constructs the exact callback URL.
+
+---
+
+## Zero-Configuration Features
+
+The SSO Proxy provides built-in auto-detection and self-healing:
+
+### 1. Dynamic Callback URL & Scheme Auto-Detection
+- **`REDIRECT_URI` is optional**: Leave it blank in `.env`. The SSO proxy dynamically detects the scheme (`https` vs `http`) and host (`xg-lab-2.assurecraft.com`, `192.168.1.253`, or `localhost`) for every request.
+- **Dynamic Cookie Security**: Automatically sets `SESSION_COOKIE_SECURE = True` for HTTPS requests (Cloudflare) and `SESSION_COOKIE_SECURE = False` for HTTP requests (LAN / localhost). This prevents session cookies from being dropped on plain HTTP, eliminating `MismatchingStateError` CSRF crashes.
+
+### 2. Automatic MongoDB Secret Retrieval
+- **`GADS_JWT_SECRET` and `GADS_DEFAULT_SECRET` are optional**:
+  - The proxy connects directly to MongoDB (auto-discovering via `gads-mongodb` container, Docker host socket, or localhost).
+  - Fetches the origin signing key and claims for `GADS_ORIGIN` (e.g. `sso.assurecraft.com`).
+  - Fetches the bootstrap default signing key (`is_default: true`) and tenant.
+  - Caches keys in memory for 60 seconds.
+  - Manual database inspection (`mongosh`) and copy-pasting keys into `.env` is no longer needed.
+
+---
+
 ## Files
 
 | File | Purpose |
@@ -37,67 +114,81 @@ Browser → Cloudflare (HTTPS) → nginx:80 → GADS hub:10000
 ## Imports and bootstrap
 
 ```python
-import os, time, logging, json, requests as http_requests
+import os, time, logging, json, base64, socket, requests as http_requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 load_dotenv()
 import jwt as pyjwt
+import pymongo
 from authlib.integrations.flask_client import OAuth
 from flask import Flask, request, redirect, session, jsonify, make_response, Response
 ```
 
-`load_dotenv()` runs before the config reads so the app works both as `python app.py` and `gunicorn app:app`. The `requests` library is aliased to `http_requests` to avoid shadowing Flask's own `request` proxy. `json` is used in `/auth/logout` to safely serialize the redirect URL into a JavaScript string literal.
-
-## App creation
-
-```python
-app = Flask(__name__, static_folder=None)
-```
-
-`static_folder=None` disables Flask's built-in `/static/<path>` route. Without this, Flask intercepts all `/static/*` requests, tries to serve them from the container's (nonexistent) `static/` directory, and returns 404 — before the catch-all proxy route ever sees them. nginx now handles static files by proxying them directly to GADS hub.
+`load_dotenv()` runs before config reads. `pymongo` is imported for direct queries to MongoDB for GADS secret keys. `socket` is used to communicate directly with `/var/run/docker.sock` to discover the internal container IP of `gads-mongodb`.
 
 ## Configuration
 
-All configuration comes from environment variables loaded by `dotenv`. There are no defaults for secrets — missing required vars cause a hard crash on startup, which is intentional (fail fast, clear message).
+Only 4 core variables are mandatory in `.env`: `FLASK_SECRET_KEY`, `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, and `AUTH0_CLIENT_SECRET`.
+
+All other variables (`REDIRECT_URI`, `GADS_JWT_SECRET`, `GADS_DEFAULT_SECRET`, `GADS_DEFAULT_TENANT`) have dynamic auto-detection or database lookup routines.
 
 ```python
 FLASK_SECRET_KEY = os.environ["FLASK_SECRET_KEY"]
+AUTH0_DOMAIN = os.environ["AUTH0_DOMAIN"]
+AUTH0_CLIENT_ID = os.environ["AUTH0_CLIENT_ID"]
+AUTH0_CLIENT_SECRET = os.environ["AUTH0_CLIENT_SECRET"]
+REDIRECT_URI = os.environ.get("REDIRECT_URI", "").strip()
+GADS_ORIGIN = os.environ.get("GADS_ORIGIN", "sso.assurecraft.com")
+GADS_JWT_SECRET = os.environ.get("GADS_JWT_SECRET", "")
 ```
 
-This key signs the Flask session cookie. If it changes, all existing sessions become invalid (users must re-login). The installer generates a 64-char hex string via `secrets.token_hex(32)`.
+## Dynamic Scheme, Host & Redirect URI Detection
+
+Instead of requiring a single hardcoded callback URL, the SSO proxy inspects each incoming request:
 
 ```python
-GADS_ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("GADS_ADMIN_EMAILS", "").split(",") if e.strip()}
+def get_request_scheme():
+    cf_visitor = request.headers.get("Cf-Visitor")
+    if cf_visitor and '"https"' in cf_visitor:
+        return "https"
+    proto = request.headers.get("X-Forwarded-Proto")
+    if proto:
+        return proto.split(",")[0].strip()
+    return request.scheme
+
+def get_request_host():
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or request.host
+    return host.split(",")[0].strip()
+
+def get_redirect_uri():
+    if REDIRECT_URI:
+        return REDIRECT_URI
+    scheme = get_request_scheme()
+    host = get_request_host()
+    return f"{scheme}://{host}/auth/callback"
 ```
 
-Builds a set of lowercase admin emails. Used by both JWT minting functions to decide whether a user gets `role: "admin"` with scopes `["user", "admin"]`, or just `role: "user"` with scopes `["user"]`.
+- When accessed through Cloudflare, `Cf-Visitor` or `X-Forwarded-Proto` reveals `https://`, generating `https://xg-lab-2.assurecraft.com/auth/callback`.
+- When accessed locally on LAN, it generates `http://192.168.1.253/auth/callback`.
+- When tested locally on the machine, it generates `http://localhost/auth/callback`.
+
+## Dynamic Session Cookie Configuration
 
 ```python
-GADS_DEFAULT_SECRET = os.environ.get("GADS_DEFAULT_SECRET", "tjsqEmu80WIMiyGJtP1WVdr3s81GIR3NttVgLj6mWUo=")
-GADS_DEFAULT_TENANT = os.environ.get("GADS_DEFAULT_TENANT", "5qnpXIGzC4Rqk_wb5DIYLKFBkfhLwtZ72ZUZlkQvO5A=")
-```
-
-These are read from environment variables with hardcoded fallbacks for backwards compatibility. They are **not** universal defaults — see [Where the default key comes from](#where-the-default-key-comes-from) below. Used only by `mint_gads_jwt` (the React-facing token); `mint_origin_jwt` uses the admin-configured `GADS_JWT_SECRET`.
-
-## Session cookie configuration
-
-```python
-app.config.update(
-    SESSION_COOKIE_NAME="gads_sso_session",
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=10),
-)
+@app.before_request
+def adjust_session_cookie_security():
+    """Dynamically adapt cookie security: Secure=True if over HTTPS (e.g. Cloudflare), False on HTTP (LAN/localhost)."""
+    if os.environ.get("SESSION_COOKIE_SECURE") is None:
+        app.config["SESSION_COOKIE_SECURE"] = (get_request_scheme() == "https")
 ```
 
 | Setting | Value | Reason |
 |---------|-------|--------|
-| `SESSION_COOKIE_NAME` | `gads_sso_session` | Namespaced — won't collide with GADS's own session cookie if it uses one |
-| `SESSION_COOKIE_HTTPONLY` | `True` | JavaScript can't read the cookie — XSS can't steal the session |
-| `SESSION_COOKIE_SECURE` | `True` | Cookie only sent over HTTPS. Cloudflare provides TLS at the edge |
-| `SESSION_COOKIE_SAMESITE` | `Lax` | Cookies are sent for top-level navigations from Auth0 (the OAuth redirect) but not for cross-site subrequests |
-| `PERMANENT_SESSION_LIFETIME` | `10 hours` | Covers a full workday. When `session.permanent = True` (set after login), the cookie expires 10 hours from last request |
+| `SESSION_COOKIE_NAME` | `gads_sso_session` | Namespaced — won't collide with GADS's internal cookies |
+| `SESSION_COOKIE_HTTPONLY` | `True` | JavaScript cannot read the cookie — XSS protection |
+| `SESSION_COOKIE_SECURE` | **Dynamic** (`True` on HTTPS, `False` on HTTP) | Crucial fix: Browsers reject `Secure` cookies over plain HTTP (LAN `192.168.1.253`), which would cause session loss and `MismatchingStateError` CSRF crashes |
+| `SESSION_COOKIE_SAMESITE` | `Lax` | Sent for top-level OAuth callback navigation from Auth0 |
+| `PERMANENT_SESSION_LIFETIME` | `10 hours` | Session valid for 10 hours from last activity |
 
 ## Auth0 OAuth client setup
 
@@ -119,6 +210,32 @@ Registers Auth0 as an OAuth client via authlib. The `server_metadata_url` points
 
 ---
 
+### Automatic MongoDB Secret Discovery & Caching
+
+Instead of requiring manual database inspection and copying keys into `.env`, the SSO proxy resolves keys on the fly from MongoDB:
+
+```python
+def refresh_mongo_keys():
+    """Fetch secret keys from MongoDB secret_keys collection (cached for 60s)."""
+    # 1. Check in-memory cache (60s TTL)
+    # 2. Query MongoDB 'secret_keys' collection:
+    #    - Find origin_doc matching {"origin": GADS_ORIGIN, "disabled": {"$ne": True}}
+    #    - Find default_doc matching {"is_default": True, "disabled": {"$ne": True}}
+    # 3. Store keys, user claims, and tenant claims in cache
+```
+
+Candidate connection addresses are attempted in order:
+1. `MONGO_URI` (if explicitly provided in `.env`)
+2. `mongodb://gads-mongodb:27017` (Docker Compose network)
+3. IP address discovered from Docker daemon via `/var/run/docker.sock`
+4. `mongodb://localhost:27017` and `mongodb://host.docker.internal:27017`
+
+### Helper Resolvers:
+- **`get_origin_signing_info()`**: Returns `(secret, user_claim, tenant_claim, tenant_val)` prioritizing the active key in MongoDB for `GADS_ORIGIN`, falling back to `GADS_JWT_SECRET` in `.env`, or default key.
+- **`get_default_signing_info()`**: Returns `(secret, tenant)` prioritizing the active default key in MongoDB (`is_default: true`), falling back to `GADS_DEFAULT_SECRET` in `.env`.
+
+---
+
 ## JWT functions
 
 ### `mint_gads_jwt(email)`
@@ -128,24 +245,25 @@ def mint_gads_jwt(email):
     now = datetime.now(timezone.utc)
     role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
     scopes = ["user", "admin"] if role == "admin" else ["user"]
+    secret, tenant = get_default_signing_info()
     payload = {
         "iss": "gads", "sub": email,
         "exp": int((now + timedelta(hours=1)).timestamp()),
         "iat": int(now.timestamp()),
         "username": email, "role": role, "scope": scopes,
-        "tenant": GADS_DEFAULT_TENANT,
+        "tenant": tenant,
     }
-    return pyjwt.encode(payload, GADS_DEFAULT_SECRET, algorithm="HS256")
+    return pyjwt.encode(payload, secret, algorithm="HS256")
 ```
 
 Creates the JWT that the **React frontend** stores in `localStorage.accessToken` and sends with API calls.
 
 - **Issuer** is `"gads"` — since no `origin` claim is present, GADS falls back to its auto-generated default key for verification.
 - **TTL is 1 hour** — longer than the origin JWT because the browser holds onto this. A new one is minted on each page load.
-- **Tenant** is `GADS_DEFAULT_TENANT` — should match the tenant GADS uses internally. Configurable via env var.
+- **Tenant** is dynamically fetched from MongoDB's default secret doc (or `GADS_DEFAULT_TENANT`).
 - **Role** is `"admin"` if the user's email is in `GADS_ADMIN_EMAILS`, otherwise falls back to `GADS_DEFAULT_ROLE` (usually `"user"`).
 - **Scopes** expand to `["user", "admin"]` for admins, `["user"]` otherwise.
-- **Secret** is `GADS_DEFAULT_SECRET` — must match the auto-generated default key in GADS's MongoDB. See [Where the default key comes from](#where-the-default-key-comes-from).
+- **Secret** is automatically retrieved from MongoDB (`is_default: true`).
 
 ### `mint_origin_jwt(email)`
 
@@ -153,44 +271,42 @@ Creates the JWT that the **React frontend** stores in `localStorage.accessToken`
 def mint_origin_jwt(email):
     now = datetime.now(timezone.utc)
     role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
+    secret, user_claim, tenant_claim, tenant_val = get_origin_signing_info()
     payload = {
         "sub": email, "username": email, "role": role, "scope": [role],
-        "tenant": GADS_TENANT_VALUE,
+        "tenant": tenant_val,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=GADS_TOKEN_TTL_SECONDS)).timestamp()),
         "iss": "gads-sso-proxy", "origin": GADS_ORIGIN,
-        GADS_USER_CLAIM: email, GADS_TENANT_CLAIM: GADS_TENANT_VALUE,
+        user_claim: email, tenant_claim: tenant_val,
     }
-    return pyjwt.encode(payload, GADS_JWT_SECRET, algorithm="HS256")
+    return pyjwt.encode(payload, secret, algorithm="HS256")
 ```
 
 Creates the JWT for **server-to-server** communication — nginx injects this as the `Authorization: Bearer` header on every upstream request to GADS hub.
 
 - **Issuer** is `"gads-sso-proxy"` — identifies this proxy as the token source.
-- **Origin claim** is critical: GADS's `ValidateJWT` reads `origin` from the payload to determine which secret key to verify against. Without it, GADS falls back to issuer-based lookup which may use the wrong key.
-- **TTL is short** (default 300s / 5 min) — a fresh token is minted on every request via `/auth/verify`, so it only needs to survive one upstream round-trip.
-- **Dynamic claim names** — `GADS_USER_CLAIM` and `GADS_TENANT_CLAIM` are configurable. The keys in the JWT payload must match exactly what was entered in GADS's "Add New Secret Key" form (User Identifier Claim / Tenant Identifier Claim fields).
-- **Secret** is `GADS_JWT_SECRET` from `.env` — this must match the "Secret Key" value in GADS's form.
+- **Origin claim** is critical: GADS's `ValidateJWT` reads `origin` from the payload to determine which secret key to verify against.
+- **TTL is short** (default 300s / 5 min) — a fresh token is minted on every request via `/auth/verify`, surviving one upstream round-trip.
+- **Dynamic claim names & secret** — resolved automatically from MongoDB (`secret_keys` collection for `origin: GADS_ORIGIN`), matching the key created in GADS UI.
 
 ### Why two different JWTs?
 
 | | GADS JWT | Origin JWT |
 |---|---|---|
 | **Consumer** | React browser app | GADS hub (server) |
-| **Secret** | Auto-generated per-install (MongoDB `secret_keys`, `is_default: true`) | Admin-configured key |
+| **Secret** | Auto-retrieved from MongoDB (`is_default: true`) | Auto-retrieved from MongoDB (`origin: GADS_ORIGIN`) |
 | **Issuer** | `"gads"` | `"gads-sso-proxy"` |
 | **Has origin?** | No | Yes |
 | **TTL** | 1 hour | 5 minutes (configurable) |
 | **Stored in** | `localStorage.accessToken` | Never stored; minted per-request |
 | **Purpose** | API calls from the UI | Proxied page loads and API forwarding |
 
-The separation exists because the GADS hub validates these differently. Origin-scoped JWTs (with an `origin` claim) route to the admin's custom secret key. Issuer-scoped JWTs (without `origin`) fall back to the auto-generated default key. This lets the proxy talk to GADS with a strong admin-controlled secret while the React app uses the per-instance bootstrap key.
-
 ---
 
 ## Where the default key comes from
 
-`GADS_DEFAULT_SECRET` is **not** a universal constant. It is auto-generated by GADS on first startup and stored in MongoDB.
+`GADS_DEFAULT_SECRET` is auto-generated by GADS on first startup and stored in MongoDB.
 
 When GADS hub starts, it initializes a `SecretCache` (`secretcache.go`). The cache calls `Refresh()`, which checks MongoDB's `secret_keys` collection for existing keys. If the collection is empty (fresh install):
 
@@ -210,33 +326,14 @@ if len(secretKeys) == 0 {
 
 `generateRandomKey(32)` uses Go's `crypto/rand.Read()` — cryptographically secure random bytes, base64-encoded. **Every GADS installation gets a different key.**
 
-This key becomes the fallback for all JWT operations in GADS:
+### Automatic vs Manual Retrieval
 
-- **Signing** (`GenerateJWT`): if no origin-specific key is configured, tokens are signed with this default.
-- **Verification** (`ValidateJWT`): JWTs without an `origin` claim (or with an origin that has no matching key) are verified against this default.
-
-### Retrieving the key
-
-After GADS has started at least once, retrieve the key from MongoDB:
-
-```bash
-docker exec gads-mongodb mongosh --quiet --eval \
-  "db.getSiblingDB('gads').secret_keys.findOne({is_default: true}).key"
-```
-
-Add it to `.env`:
-
-```bash
-GADS_DEFAULT_SECRET=<output-from-above-command>
-```
-
-Then rebuild the proxy:
-
-```bash
-cd GadsAuth && docker compose up -d --build
-```
-
-The installer (`install.sh`) does this automatically after starting GADS hub. If auto-retrieval fails, it prints the manual command at the end of the install.
+- **Automatic (Default):** The SSO proxy now reads this key and origin keys directly from MongoDB at runtime. You do not need to do anything!
+- **Manual Verification (Optional):** If you wish to inspect the key manually:
+  ```bash
+  docker exec gads-mongodb mongosh --quiet --eval \
+    "db.getSiblingDB('gads').secret_keys.findOne({is_default: true}).key"
+  ```
 
 ---
 
@@ -288,21 +385,25 @@ When the nginx config routes requests directly to GADS hub (current setup), this
 def login():
     session.clear()
     session["post_login_redirect"] = request.args.get("redirect", POST_LOGIN_DEFAULT)
-    return auth0.authorize_redirect(redirect_uri=REDIRECT_URI)
+    redirect_uri = get_redirect_uri()
+    log.info("Initiating Auth0 login redirect with callback: %s", redirect_uri)
+    return auth0.authorize_redirect(redirect_uri=redirect_uri)
 ```
 
 Called when nginx's `@force_login` redirects an unauthenticated user here, or when a user clicks "Login."
 
 1. **Clears any stale session** — ensures no leftover data from a previous login attempt.
 2. **Stores the redirect target** in the session — after Auth0 callback, the user will be sent back to the page they originally requested. For example, if someone bookmarks `/devices`, they'll land there after login, not at `/`.
-3. **Redirects to Auth0** — `auth0.authorize_redirect()` builds the Auth0 `/authorize` URL with the correct `client_id`, `redirect_uri`, `scope`, `state` (CSRF token), and `nonce` (OIDC replay protection). Authlib handles all of this automatically.
+3. **Dynamically resolves `redirect_uri`** — using `get_redirect_uri()`, matches the scheme (`https` or `http`) and host header of the incoming request.
+4. **Redirects to Auth0** — `auth0.authorize_redirect(redirect_uri=redirect_uri)` builds the Auth0 `/authorize` URL with the correct `client_id`, dynamic `redirect_uri`, `scope`, `state` (CSRF token), and `nonce` (OIDC replay protection).
 
 ### `GET /auth/callback`
 
 ```python
 @app.route("/auth/callback")
 def callback():
-    token = auth0.authorize_access_token()
+    redirect_uri = get_redirect_uri()
+    token = auth0.authorize_access_token(redirect_uri=redirect_uri)
     userinfo = token.get("userinfo")
     if not userinfo:
         return jsonify({"error": "no_userinfo"}), 400
@@ -319,7 +420,7 @@ def callback():
 
 The URL Auth0 redirects to after the user authenticates. The query string contains `?code=...&state=...`.
 
-1. **`authorize_access_token()`** — authlib exchanges the authorization `code` for tokens (access token + id_token), validates the `state` parameter against what was stored in the session (CSRF protection), validates the `nonce` (replay protection), and fetches `userinfo` from Auth0's `/userinfo` endpoint. If `state` doesn't match (e.g., session lost due to restart, or cross-site request), it raises `MismatchingStateError`.
+1. **`authorize_access_token(redirect_uri=redirect_uri)`** — authlib exchanges the authorization `code` for tokens (access token + id_token) using the matching dynamic redirect URI. It validates the `state` parameter against what was stored in the session (CSRF protection), validates the `nonce` (replay protection), and fetches `userinfo`.
 2. **Extracts email** — the user's verified email from Auth0 becomes their GADS identity. Lowercased for consistency with `GADS_ADMIN_EMAILS`.
 3. **Creates the session** — `session.permanent = True` activates the 10-hour lifetime. Stores email, display name, and authentication timestamp.
 4. **Redirects** — pops the stored redirect target (consuming it so it's not reused) and sends the user there. Defaults to `/`.
@@ -330,7 +431,8 @@ The URL Auth0 redirects to after the user authenticates. The query string contai
 @app.route("/auth/logout")
 def logout():
     session.clear()
-    return_to = REDIRECT_URI.rsplit("/auth/", 1)[0]
+    redirect_uri = get_redirect_uri()
+    return_to = redirect_uri.rsplit("/auth/", 1)[0]
     auth0_logout = f"https://{AUTH0_DOMAIN}/v2/logout?client_id={AUTH0_CLIENT_ID}&returnTo={return_to}"
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head><body>
@@ -343,9 +445,9 @@ window.location.href = {json.dumps(auth0_logout)};
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 ```
 
-1. **Clears the Flask session** — removes `user_email`, `user_name`, `authenticated_at`. The session cookie is effectively invalidated.
-2. **Builds the Auth0 logout URL** — Auth0's `/v2/logout` clears the Auth0 session and redirects back to the GADS root. `return_to` is extracted from `REDIRECT_URI` by stripping the `/auth/callback` suffix (e.g., `https://gads-lab-pi.assurecraft.com/auth/callback` becomes `https://gads-lab-pi.assurecraft.com`).
-3. **Returns an HTML page, not a redirect** — the page calls `localStorage.clear()` (wiping the React JWT and any other client-side state) **before** redirecting to Auth0. A plain 302 redirect can't execute JavaScript, so the old approach left stale tokens in localStorage. `json.dumps()` safely serializes the URL for embedding in JavaScript.
+1. **Clears the Flask session** — removes `user_email`, `user_name`, `authenticated_at`.
+2. **Builds the Auth0 logout URL** — extracts the base origin dynamically via `redirect_uri.rsplit("/auth/", 1)[0]`. Auth0 clears the session and returns the user to the dynamic origin (e.g. `https://xg-lab-2.assurecraft.com` or `http://192.168.1.253`).
+3. **Wipes localStorage before redirecting** — `localStorage.clear()` removes the client-side JWT before browser redirects to Auth0 logout.
 
 ### `GET /auth/verify`
 
@@ -489,24 +591,36 @@ Matches any URL not caught by a more specific route. With the current nginx conf
 
 ## Environment Variables
 
+### Required Variables (Only 4 needed!)
+
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `FLASK_SECRET_KEY` | Yes | — | Session cookie signing key |
-| `AUTH0_DOMAIN` | Yes | — | Auth0 tenant domain |
-| `AUTH0_CLIENT_ID` | Yes | — | Auth0 application client ID |
-| `AUTH0_CLIENT_SECRET` | Yes | — | Auth0 application client secret |
-| `REDIRECT_URI` | Yes | — | Auth0 callback URL (must match Allowed Callback URLs) |
-| `GADS_ORIGIN` | Yes | — | Origin claim value (matches GADS secret key form) |
-| `GADS_JWT_SECRET` | Yes | — | Signing key for origin JWTs (matches GADS secret key form) |
-| `POST_LOGIN_DEFAULT` | No | `/` | Where to redirect after login |
-| `GADS_USER_CLAIM` | No | `username` | JWT claim name for user identifier |
-| `GADS_TENANT_CLAIM` | No | `tenant` | JWT claim name for tenant identifier |
+| `FLASK_SECRET_KEY` | **Yes** | — | Flask session cookie signing key (`secrets.token_hex(32)`) |
+| `AUTH0_DOMAIN` | **Yes** | — | Auth0 tenant domain (from Auth0 Application settings) |
+| `AUTH0_CLIENT_ID` | **Yes** | — | Auth0 application Client ID |
+| `AUTH0_CLIENT_SECRET` | **Yes** | — | Auth0 application Client Secret |
+
+### Optional / Auto-Detected Variables
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `REDIRECT_URI` | No | Auto-detected | Leave empty to automatically detect callback URL based on incoming request scheme & host (`https://xg-lab-2.assurecraft.com/auth/callback`, `http://192.168.1.253/auth/callback`, `http://localhost/auth/callback`) |
+| `GADS_ORIGIN` | No | `sso.assurecraft.com` | Origin identifier claim used to query MongoDB and mint origin JWTs |
+| `GADS_JWT_SECRET` | No | Auto-retrieved | Secret key for `GADS_ORIGIN`. Auto-retrieved from MongoDB `secret_keys` collection if left blank |
+| `GADS_DEFAULT_SECRET` | No | Auto-retrieved | GADS fallback signing key (`is_default: true`). Auto-retrieved from MongoDB if left blank |
+| `GADS_DEFAULT_TENANT` | No | Auto-retrieved | Tenant identifier. Auto-retrieved from MongoDB if left blank |
+| `POST_LOGIN_DEFAULT` | No | `/` | Where to redirect user after successful login |
+| `GADS_USER_CLAIM` | No | `username` | JWT claim name for user identifier (overridden if found in MongoDB) |
+| `GADS_TENANT_CLAIM` | No | `tenant` | JWT claim name for tenant identifier (overridden if found in MongoDB) |
 | `GADS_TENANT_VALUE` | No | `assurecraft` | Tenant value in origin JWTs |
 | `GADS_TOKEN_TTL_SECONDS` | No | `300` | Origin JWT lifetime in seconds |
 | `GADS_DEFAULT_ROLE` | No | `user` | Role assigned to non-admin users |
-| `GADS_ADMIN_EMAILS` | No | — | Comma-separated admin emails |
-| `GADS_PORT` | No | `10000` | GADS hub port |
-| `NGINX_PORT` | No | `80` | nginx public port |
+| `GADS_ADMIN_EMAILS` | No | — | Comma-separated admin emails (assigned `admin` role and scopes) |
+| `GADS_PORT` | No | `10000` | GADS hub port on the host |
+| `NGINX_PORT` | No | `80` | nginx public port (service target for Cloudflare Tunnel) |
+| `MONGO_URI` | No | Auto-discovered | MongoDB connection URI (tries `gads-mongodb:27017`, Docker socket discovery, `localhost:27017`) |
+| `MONGO_DB_NAME` | No | `gads` | GADS database name in MongoDB |
+| `SESSION_COOKIE_SECURE` | No | Auto-detected | Overrides cookie security. When omitted, dynamically adapts to `True` for HTTPS (Cloudflare) and `False` for plain HTTP (LAN) |
 
 ---
 
@@ -516,10 +630,10 @@ Matches any URL not caught by a more specific route. With the current nginx conf
 
 | Route | Method | Auth | Purpose |
 |-------|--------|------|---------|
-| `/auth/login` | GET | No | Clear session, redirect to Auth0 authorize |
-| `/auth/callback` | GET | No | Exchange Auth0 code for tokens, create session |
+| `/auth/login` | GET | No | Clear session, dynamically generate redirect URI, redirect to Auth0 authorize |
+| `/auth/callback` | GET | No | Exchange Auth0 code for tokens with dynamic redirect URI, create session |
 | `/auth/logout` | GET | No | Clear localStorage + session, redirect to Auth0 logout |
-| `/auth/verify` | GET | nginx only | Return 401 or 200 + `X-GADS-Auth-Token` header |
+| `/auth/verify` | GET | nginx only | Return 401 or 200 + `X-GADS-Auth-Token` header (minted via MongoDB secret) |
 | `/auth/legacy` | GET | No | Set legacy cookie for non-SSO access |
 | `/authenticate` | POST | Session | Return GADS JWT for SSO-authenticated users; forward to GADS otherwise |
 | `/healthz` | GET | No | Health check |
@@ -539,17 +653,19 @@ Unauthenticated users hitting any protected route get caught by `error_page 401 
 
 ---
 
-## Deployment
+## Quick Deployment
 
 ```bash
 cd GadsAuth
 cp .env.example .env
-# Edit .env with your Auth0 and GADS configuration
-docker compose build
-docker compose up -d
-```
 
-Or via the installer:
-```bash
-./install.sh
+# Edit .env and enter only the 4 required values:
+# 1. FLASK_SECRET_KEY (generate via python3 -c "import secrets; print(secrets.token_hex(32))")
+# 2. AUTH0_DOMAIN
+# 3. AUTH0_CLIENT_ID
+# 4. AUTH0_CLIENT_SECRET
+# (Leave REDIRECT_URI, GADS_JWT_SECRET, and GADS_DEFAULT_SECRET empty for auto-detection!)
+
+# Start or rebuild the SSO stack
+docker compose up -d --build
 ```

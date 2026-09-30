@@ -1,4 +1,4 @@
-import os, time, logging, json, requests as http_requests
+import os, time, logging, json, base64, socket, requests as http_requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,7 +15,7 @@ FLASK_SECRET_KEY = os.environ["FLASK_SECRET_KEY"]
 AUTH0_DOMAIN = os.environ["AUTH0_DOMAIN"]
 AUTH0_CLIENT_ID = os.environ["AUTH0_CLIENT_ID"]
 AUTH0_CLIENT_SECRET = os.environ["AUTH0_CLIENT_SECRET"]
-REDIRECT_URI = os.environ["REDIRECT_URI"]
+REDIRECT_URI = os.environ.get("REDIRECT_URI", "").strip()
 POST_LOGIN_DEFAULT = os.environ.get("POST_LOGIN_DEFAULT", "/")
 GADS_ORIGIN = os.environ.get("GADS_ORIGIN", "sso.assurecraft.com")
 GADS_JWT_SECRET = os.environ.get("GADS_JWT_SECRET", "")
@@ -31,12 +31,35 @@ GADS_DEFAULT_TENANT = os.environ.get("GADS_DEFAULT_TENANT", "")
 MONGO_URI = os.environ.get("MONGO_URI")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "gads")
 
+def get_request_scheme():
+    """Detect whether incoming request is HTTPS (Cloudflare / TLS termination) or HTTP."""
+    cf_visitor = request.headers.get("Cf-Visitor")
+    if cf_visitor and '"https"' in cf_visitor:
+        return "https"
+    proto = request.headers.get("X-Forwarded-Proto")
+    if proto:
+        return proto.split(",")[0].strip()
+    return request.scheme
+
+def get_request_host():
+    """Detect incoming Host header (from Cloudflare, LAN IP, or localhost)."""
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or request.host
+    return host.split(",")[0].strip()
+
+def get_redirect_uri():
+    """Return explicit REDIRECT_URI if configured in .env, otherwise dynamically auto-detect."""
+    if REDIRECT_URI:
+        return REDIRECT_URI
+    scheme = get_request_scheme()
+    host = get_request_host()
+    return f"{scheme}://{host}/auth/callback"
+
 # Secure cookies only over HTTPS, or when explicitly requested via env var
 cookie_secure_env = os.environ.get("SESSION_COOKIE_SECURE")
 if cookie_secure_env is not None:
     SESSION_COOKIE_SECURE = cookie_secure_env.lower() in ("true", "1", "yes")
 else:
-    SESSION_COOKIE_SECURE = REDIRECT_URI.startswith("https://")
+    SESSION_COOKIE_SECURE = REDIRECT_URI.startswith("https://") if REDIRECT_URI else False
 
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
@@ -46,6 +69,12 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=10),
 )
+
+@app.before_request
+def adjust_session_cookie_security():
+    """Dynamically adapt cookie security: Secure=True if over HTTPS (e.g. Cloudflare), False on HTTP (LAN/localhost)."""
+    if os.environ.get("SESSION_COOKIE_SECURE") is None:
+        app.config["SESSION_COOKIE_SECURE"] = (get_request_scheme() == "https")
 
 oauth = OAuth(app)
 auth0 = oauth.register(
@@ -283,11 +312,14 @@ def proxy_to_gads(path):
 def login():
     session.clear()
     session["post_login_redirect"] = request.args.get("redirect", POST_LOGIN_DEFAULT)
-    return auth0.authorize_redirect(redirect_uri=REDIRECT_URI)
+    redirect_uri = get_redirect_uri()
+    log.info("Initiating Auth0 login redirect with callback: %s", redirect_uri)
+    return auth0.authorize_redirect(redirect_uri=redirect_uri)
 
 @app.route("/auth/callback")
 def callback():
-    token = auth0.authorize_access_token()
+    redirect_uri = get_redirect_uri()
+    token = auth0.authorize_access_token(redirect_uri=redirect_uri)
     userinfo = token.get("userinfo")
     if not userinfo:
         return jsonify({"error": "no_userinfo"}), 400
@@ -304,7 +336,8 @@ def callback():
 @app.route("/auth/logout")
 def logout():
     session.clear()
-    return_to = REDIRECT_URI.rsplit("/auth/", 1)[0]
+    redirect_uri = get_redirect_uri()
+    return_to = redirect_uri.rsplit("/auth/", 1)[0]
     auth0_logout = f"https://{AUTH0_DOMAIN}/v2/logout?client_id={AUTH0_CLIENT_ID}&returnTo={return_to}"
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head><body>
@@ -372,6 +405,24 @@ def catch_all(path):
             return jsonify({"error": "not_authenticated"}), 401
         return redirect(f"/auth/login?redirect=/{path}")
     return proxy_to_gads(path)
+
+def inspect_cloudflared_token():
+    """Inspect local Cloudflare tunnel tokens and log auto-detection info."""
+    token_path = "/etc/cloudflared/token"
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, "r") as f:
+                raw = f.read().strip()
+            decoded = json.loads(base64.b64decode(raw + "==").decode("utf-8"))
+            log.info("Detected Cloudflare Tunnel on host (Tunnel ID: %s, Account: %s)", decoded.get("t"), decoded.get("a"))
+        except Exception as e:
+            log.debug("Could not inspect cloudflared token: %s", e)
+    if REDIRECT_URI:
+        log.info("Static REDIRECT_URI in .env: %s", REDIRECT_URI)
+    else:
+        log.info("REDIRECT_URI will be automatically detected per-request based on incoming Host & Scheme (Cloudflare/LAN/localhost)")
+
+inspect_cloudflared_token()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5050)
