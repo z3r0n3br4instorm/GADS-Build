@@ -1,5 +1,6 @@
 import os, time, logging, json, base64, socket, requests as http_requests
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 from dotenv import load_dotenv
 load_dotenv()
 import jwt as pyjwt
@@ -53,6 +54,12 @@ def get_redirect_uri():
     scheme = get_request_scheme()
     host = get_request_host()
     return f"{scheme}://{host}/auth/callback"
+
+def get_auth0_logout_url():
+    """Auth0 logout URL that returns the browser to this site's origin (must be in Auth0 Allowed Logout URLs)."""
+    return_to = get_redirect_uri().rsplit("/auth/", 1)[0]
+    query = urlencode({"client_id": AUTH0_CLIENT_ID, "returnTo": return_to})
+    return f"https://{AUTH0_DOMAIN}/v2/logout?{query}"
 
 # Secure cookies only over HTTPS, or when explicitly requested via env var
 cookie_secure_env = os.environ.get("SESSION_COOKIE_SECURE")
@@ -368,7 +375,9 @@ def login():
     session["post_login_redirect"] = request.args.get("redirect", POST_LOGIN_DEFAULT)
     redirect_uri = get_redirect_uri()
     log.info("Initiating Auth0 login redirect with callback: %s", redirect_uri)
-    return auth0.authorize_redirect(redirect_uri=redirect_uri)
+    resp = auth0.authorize_redirect(redirect_uri=redirect_uri, prompt="login")
+    resp.delete_cookie("gads_legacy", path="/")
+    return resp
 
 @app.route("/auth/callback")
 def callback():
@@ -428,56 +437,78 @@ def callback():
     </p>
 </body>
 </html>"""
-    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+    resp = make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
+    resp.delete_cookie("gads_legacy", path="/")
+    return resp
 
 @app.route("/auth/logout")
 def logout():
     session.clear()
-    redirect_uri = get_redirect_uri()
-    return_to = redirect_uri.rsplit("/auth/", 1)[0]
-    auth0_logout = f"https://{AUTH0_DOMAIN}/v2/logout?client_id={AUTH0_CLIENT_ID}&returnTo={return_to}"
+    auth0_logout = get_auth0_logout_url()
     html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head><body>
+<html><head><meta charset="utf-8"><title>Logging Out...</title></head><body>
 <script>
-localStorage.clear();
+try {{ localStorage.clear(); }} catch(e) {{}}
 window.location.href = {json.dumps(auth0_logout)};
 </script>
-<p>Logging out...</p>
+<p style="font-family: sans-serif; text-align: center; margin-top: 60px; color: #444;">Logging out...</p>
 </body></html>"""
-    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+    resp = make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
+    resp.delete_cookie("gads_sso_session", path="/")
+    resp.delete_cookie("gads_legacy", path="/")
+    return resp
 
 @app.route("/auth/verify")
 def verify():
     email = session.get("user_email")
-    if not email:
-        return jsonify({"error": "not_authenticated"}), 401
+    if email:
+        role = ensure_gads_user(email)
+        token = mint_gads_jwt(email)
+        secret, tenant = get_default_signing_info()
 
-    role = ensure_gads_user(email)
-    origin_token = mint_origin_jwt(email)
-    react_token = mint_gads_jwt(email)
-    secret, tenant = get_default_signing_info()
+        resp = make_response("", 200)
+        resp.headers["X-GADS-Auth-Token"] = token
+        resp.headers["X-GADS-React-Token"] = token
+        resp.headers["X-GADS-User"] = email
+        resp.headers["X-GADS-Role"] = role
+        resp.headers["X-GADS-Tenant"] = tenant or ""
+        resp.headers["X-GADS-Mode"] = "sso"
+        return resp
 
-    resp = make_response("", 200)
-    resp.headers["X-GADS-Auth-Token"] = origin_token
-    resp.headers["X-GADS-React-Token"] = react_token
-    resp.headers["X-GADS-User"] = email
-    resp.headers["X-GADS-Role"] = role
-    resp.headers["X-GADS-Tenant"] = tenant or ""
-    return resp
+    # Allow request if user is in legacy auth mode
+    if request.cookies.get("gads_legacy") == "1":
+        resp = make_response("", 200)
+        resp.headers["X-GADS-Mode"] = "legacy"
+        return resp
+
+    return jsonify({"error": "not_authenticated"}), 401
 
 @app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok"}), 200
 
-# Intercept GADS native login - return JWT for SSO-authenticated users
+# Intercept GADS native login - return JWT for SSO-authenticated users, or forward for legacy
 @app.route("/authenticate", methods=["POST"])
 def authenticate():
     email = session.get("user_email")
     if not email:
-        resp = http_requests.post(f"http://host.docker.internal:{GADS_PORT}/authenticate",
-                                   headers={"Host": request.host},
-                                   data=request.get_data(), timeout=30)
-        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "text/html"))
+        headers = {
+            "Host": request.host,
+            "Content-Type": request.content_type or "application/json",
+        }
+        if request.headers.get("Authorization"):
+            headers["Authorization"] = request.headers["Authorization"]
+        resp = http_requests.post(
+            f"http://host.docker.internal:{GADS_PORT}/authenticate",
+            headers=headers,
+            data=request.get_data(),
+            timeout=30
+        )
+        return Response(
+            resp.content,
+            status=resp.status_code,
+            content_type=resp.headers.get("Content-Type", "application/json")
+        )
     role = ensure_gads_user(email)
     gadstoken = mint_gads_jwt(email)
     secret, tenant = get_default_signing_info()
@@ -494,11 +525,79 @@ def authenticate():
         }
     })
 
+# Legacy auth entry point: logs user out from current SSO session and sends to native GADS login
+@app.route("/authenticate/legacy")
+@app.route("/authenticate/legacy/")
+@app.route("/legacy/auth")
+@app.route("/legacy/auth/")
 @app.route("/auth/legacy")
-def legacy_login():
+@app.route("/auth/legacy/")
+def legacy_auth():
     session.clear()
-    resp = make_response(redirect("/"))
-    resp.set_cookie("gads_legacy", "1", max_age=3600, httponly=True, secure=SESSION_COOKIE_SECURE, samesite="Lax")
+    log.info("Switching user to GADS legacy auth mode")
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Switching to GADS Login...</title>
+</head>
+<body>
+    <script>
+        try {
+            localStorage.clear();
+        } catch (e) {}
+        window.location.replace("/login");
+    </script>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; margin-top: 60px; color: #444;">
+        Switching to GADS login...
+    </p>
+</body>
+</html>"""
+    resp = make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
+    resp.delete_cookie("gads_sso_session", path="/")
+    resp.set_cookie(
+        "gads_legacy", "1",
+        max_age=86400,
+        path="/",
+        httponly=True,
+        secure=app.config["SESSION_COOKIE_SECURE"],
+        samesite="Lax"
+    )
+    return resp
+
+# Logout endpoint: clears session in proxy, forwards to GADS hub, and clears cookies
+@app.route("/logout", methods=["GET", "POST"])
+def gads_logout():
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        try:
+            http_requests.post(
+                f"http://host.docker.internal:{GADS_PORT}/logout",
+                headers={"Authorization": auth_header, "Host": request.host},
+                timeout=5
+            )
+        except Exception as e:
+            log.warning("Failed to forward logout to GADS hub: %s", e)
+
+    session.clear()
+    log.info("User logged out from GADS and SSO proxy")
+
+    if request.method == "POST":
+        resp = jsonify({"success": True, "message": "logged out"})
+    else:
+        auth0_logout = get_auth0_logout_url()
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Logging Out...</title></head><body>
+<script>
+try {{ localStorage.clear(); }} catch(e) {{}}
+window.location.href = {json.dumps(auth0_logout)};
+</script>
+<p style="font-family: sans-serif; text-align: center; margin-top: 60px; color: #444;">Logging out...</p>
+</body></html>"""
+        resp = make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
+
+    resp.delete_cookie("gads_sso_session", path="/")
+    resp.delete_cookie("gads_legacy", path="/")
     return resp
 
 # Catch-all: proxy to GADS with JWT injection
@@ -509,7 +608,10 @@ def catch_all(path):
         gads_url = f"http://host.docker.internal:{GADS_PORT}/{path}"
         if request.query_string:
             gads_url += f"?{request.query_string.decode()}"
-        resp = http_requests.get(gads_url, headers={"Host": request.host}, timeout=30)
+        headers = {"Host": request.host}
+        if request.headers.get("Authorization"):
+            headers["Authorization"] = request.headers["Authorization"]
+        resp = http_requests.get(gads_url, headers=headers, timeout=30)
         return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "text/html"))
     email = session.get("user_email")
     if not email:

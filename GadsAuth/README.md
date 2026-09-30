@@ -589,9 +589,18 @@ Matches any URL not caught by a more specific route. With the current nginx conf
 
 ### Logout
 
-1. `/auth/logout` returns an HTML page that calls `localStorage.clear()` to wipe the React JWT
-2. Then redirects to Auth0 `/v2/logout` which clears the Auth0 session
-3. Auth0 redirects back to the GADS root
+The GADS **Logout** button doesn't call the server. It only removes `accessToken` (and the other user keys) from `localStorage`. For SSO users, the script nginx injects into GADS pages wraps `localStorage.removeItem`: when `accessToken` is removed, the browser is sent to `/auth/logout`, which:
+
+1. Clears the proxy session and the `gads_sso_session` / `gads_legacy` cookies
+2. Returns an HTML page that calls `localStorage.clear()` to wipe the React JWT
+3. Redirects to Auth0 `/v2/logout`, which clears the Auth0 session
+4. Auth0 redirects back to the GADS root, which starts a fresh Auth0 login
+
+The origin Auth0 returns to must be listed in **Allowed Logout URLs**.
+
+### Legacy (native GADS) login
+
+`GET /authenticate/legacy` clears the SSO session and `localStorage`, sets a `gads_legacy=1` cookie (24 h), and sends the user to the native GADS `/login` screen. `/legacy/auth` and `/auth/legacy` are older aliases. Logging in through `/auth/login` removes the legacy cookie again.
 
 ---
 
@@ -640,7 +649,7 @@ Matches any URL not caught by a more specific route. With the current nginx conf
 | `/auth/callback` | GET | No | Exchange Auth0 code for tokens with dynamic redirect URI, create session |
 | `/auth/logout` | GET | No | Clear localStorage + session, redirect to Auth0 logout |
 | `/auth/verify` | GET | nginx only | Return 401 or 200 + `X-GADS-Auth-Token` header (minted via MongoDB secret) |
-| `/auth/legacy` | GET | No | Set legacy cookie for non-SSO access |
+| `/authenticate/legacy` | GET | No | Drop SSO session, set legacy cookie, send user to native GADS login (aliases: `/legacy/auth`, `/auth/legacy`) |
 | `/authenticate` | POST | Session | Return GADS JWT for SSO-authenticated users; forward to GADS otherwise |
 | `/healthz` | GET | No | Health check |
 | `/` `/<path>` | Any | Session | Catch-all: proxy to GADS hub with JWT injection |
