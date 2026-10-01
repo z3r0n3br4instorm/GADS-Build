@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# GADS SSO proxy deploy script
+# ============================================================
+# Deploys GadsAuth (SSO proxy + nginx) to every node listed in a CSV.
+# Run it from your own machine; it does not touch install.sh.
+#
+# For each node it:
+#   1. Connects over SSH (key first, then the CSV password)
+#   2. Pulls the repo from GitHub (it must already exist in ~; nodes without it fail)
+#   3. Merges deploy.env into the node's GadsAuth/.env
+#   4. Rebuilds gads-sso-proxy and restarts gads-nginx
+#   5. Checks nginx config and /healthz
+#   6. Points cloudflared at nginx (port 80) if a local config.yml routes to the hub;
+#      for dashboard-managed tunnels, checks the routes and fails if they bypass SSO
+#   7. Prints a PASS/FAIL table per node
+#      and saves it to deploy-reports/
+#
+# Usage:
+#   ./deploy.sh                          # deploy.env + nodes.csv next to this script
+#   ./deploy.sh -e prod.env -n prod.csv  # other files
+#   ./deploy.sh --only 192.168.1.253     # a single node from the CSV
+#   ./deploy.sh --install-key            # also install your SSH key on password nodes
+#
+# nodes.csv format (header required, password may be empty for key-only nodes):
+#   username,ip,password
+#   xg,192.168.1.253,secret
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/deploy.env"
+NODES_FILE="$SCRIPT_DIR/nodes.csv"
+ONLY_IP=""
+INSTALL_KEY=false
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+node_log() { echo -e "${BLUE}[$1]${NC} $2"; }
+
+usage() { sed -n '17,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# ---------- Arguments ----------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e|--env)      ENV_FILE="$2"; shift 2 ;;
+    -n|--nodes)    NODES_FILE="$2"; shift 2 ;;
+    --only)        ONLY_IP="$2"; shift 2 ;;
+    --install-key) INSTALL_KEY=true; shift ;;
+    -h|--help)     usage 0 ;;
+    *)             echo "Unknown option: $1"; usage 1 ;;
+  esac
+done
+
+# ---------- Prerequisite checks ----------
+[[ -f "$ENV_FILE" ]]   || err "Env file not found: $ENV_FILE (copy deploy.env.example)"
+[[ -f "$NODES_FILE" ]] || err "Nodes file not found: $NODES_FILE (copy nodes.csv.example)"
+
+for f in "$ENV_FILE" "$NODES_FILE"; do
+  perms="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+  if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+    warn "$f contains secrets but is mode $perms — consider: chmod 600 $f"
+  fi
+done
+
+# Deploy-only settings (DEPLOY_*, CLOUDFLARE_*) are read here and never written to the node .env
+env_get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//' || true; }
+BRANCH="$(env_get DEPLOY_BRANCH)";       BRANCH="${BRANCH:-main}"
+REMOTE_DIR="$(env_get DEPLOY_REMOTE_DIR)"; REMOTE_DIR="${REMOTE_DIR:-GADS-Build}"
+
+for key in AUTH0_DOMAIN AUTH0_CLIENT_ID AUTH0_CLIENT_SECRET; do
+  [[ -n "$(env_get "$key")" ]] || err "$key is empty in $ENV_FILE"
+done
+
+# Nodes pull from GitHub, so warn if local commits haven't been pushed
+if git -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null; then
+  # Never prompt for credentials, and give up after 15s; this check only produces a warning
+  GIT_TERMINAL_PROMPT=0 git -C "$SCRIPT_DIR" -c credential.helper= fetch -q origin "$BRANCH" </dev/null >/dev/null 2>&1 &
+  fetch_pid=$!
+  for _ in $(seq 1 15); do kill -0 "$fetch_pid" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$fetch_pid" 2>/dev/null; then
+    kill "$fetch_pid" 2>/dev/null || true
+    warn "Could not reach origin to check for unpushed commits (skipped)."
+  fi
+  wait "$fetch_pid" 2>/dev/null || true
+  ahead="$(git -C "$SCRIPT_DIR" rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo 0)"
+  dirty="$(git -C "$SCRIPT_DIR" status --porcelain -- GadsAuth | wc -l | tr -d ' ')"
+  [[ "$ahead" == "0" ]] || warn "$ahead local commit(s) not pushed to origin/$BRANCH — nodes won't get them."
+  [[ "$dirty" == "0" ]] || warn "Uncommitted changes in GadsAuth/ — nodes won't get them."
+fi
+
+# Override lines sent to each node: everything except comments, blanks, DEPLOY_* and
+# CLOUDFLARE_* keys (the Cloudflare token is only used locally by set-tunnel-port.py)
+OVERRIDES_B64="$(grep -vE '^\s*(#|$)|^DEPLOY_|^CLOUDFLARE_' "$ENV_FILE" | base64 | tr -d '\n')"
+
+# ---------- SSH helpers ----------
+WORK_DIR="$(mktemp -d)"
+trap 'for s in "$WORK_DIR"/ctl-*; do [[ -S "$s" ]] && close_connection "$s" localhost; done; rm -rf "$WORK_DIR"' EXIT
+
+# Askpass helper: hands the password to ssh from an env var (never on the command line)
+ASKPASS="$WORK_DIR/askpass.sh"
+printf '#!/bin/sh\nprintf "%%s\\n" "$DEPLOY_SSH_PASS"\n' > "$ASKPASS"
+chmod 700 "$ASKPASS"
+
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ConnectionAttempts=2
+          -o ServerAliveInterval=10 -o ServerAliveCountMax=12)
+
+# Opens a shared master connection so the password (if any) is only used once per node
+open_connection() {
+  local target="$1" pass="$2" ctl="$3"
+  if ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$ctl" \
+       -o ControlPersist=600 -fN "$target" </dev/null >/dev/null 2>&1; then
+    echo "key"; return 0
+  fi
+  [[ -n "$pass" ]] || return 1
+  if DEPLOY_SSH_PASS="$pass" SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-:0}" \
+       ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password,keyboard-interactive \
+       -o NumberOfPasswordPrompts=1 -o ControlMaster=yes -o ControlPath="$ctl" \
+       -o ControlPersist=600 -fN "$target" </dev/null >/dev/null 2>&1; then
+    echo "password"; return 0
+  fi
+  return 1
+}
+
+# Runs a command over the node's master connection
+run_remote() {
+  local ctl="$1" target="$2"; shift 2
+  ssh -o ControlPath="$ctl" -o BatchMode=yes "$target" "$@"
+}
+
+close_connection() {
+  ssh -o ControlPath="$1" -O exit "$2" </dev/null >/dev/null 2>&1 || true
+}
+
+install_pubkey() {
+  local ctl="$1" target="$2" pub
+  pub="$(ls "$HOME"/.ssh/id_ed25519.pub "$HOME"/.ssh/id_rsa.pub 2>/dev/null | head -1 || true)"
+  [[ -n "$pub" ]] || { warn "No local public key found (run: ssh-keygen -t ed25519)"; return 0; }
+  run_remote "$ctl" "$target" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+    k="$(cat)"; grep -qxF "$k" ~/.ssh/authorized_keys || echo "$k" >> ~/.ssh/authorized_keys' < "$pub"
+}
+
+# ---------- Remote deploy steps (runs on the node) ----------
+# Args: branch, remote dir, base64 env overrides
+# Each check prints "@@CHECK|<name>|PASS|FAIL|WARN|<detail>"; the first FAIL stops the node.
+REMOTE_SCRIPT='
+BRANCH="$1"; REMOTE_DIR="$2"; OVERRIDES_B64="$3"
+check() { printf "@@CHECK|%s|%s|%s\n" "$1" "$2" "$3"; }
+fail()  { check "$1" FAIL "$2"; exit 1; }
+cd ~ || fail PREREQ "no home directory"
+
+# PREREQ: tools and docker access
+for tool in git docker python3 curl; do
+  command -v "$tool" >/dev/null || fail PREREQ "$tool is not installed"
+done
+if docker ps >/dev/null 2>&1; then DOCKER="docker"
+elif sudo -n docker ps >/dev/null 2>&1; then DOCKER="sudo -n docker"
+else fail PREREQ "user cannot run docker (add it to the docker group)"; fi
+if $DOCKER compose version >/dev/null 2>&1; then COMPOSE="$DOCKER compose"
+else COMPOSE="${DOCKER%docker}docker-compose"; fi
+check PREREQ PASS "git, docker, python3, curl"
+
+# REPO: must already exist in the home directory; never cloned here
+[ -d "$HOME/$REMOTE_DIR/.git" ] || fail REPO "~/$REMOTE_DIR is not a git repo on this node (not cloning)"
+cd "$HOME/$REMOTE_DIR" || fail REPO "cannot enter ~/$REMOTE_DIR"
+[ -f GadsAuth/docker-compose.yml ] || fail REPO "~/$REMOTE_DIR/GadsAuth/docker-compose.yml missing"
+check REPO PASS "~/$REMOTE_DIR"
+
+# PULL: back up local edits, then fast-forward to origin
+note=""
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  stash_msg="deploy.sh backup $(date +%Y%m%d-%H%M%S)"
+  git stash push -q -m "$stash_msg" || fail PULL "could not stash local edits"
+  note=" (local edits stashed: $stash_msg)"
+fi
+out="$(git fetch -q origin "$BRANCH" 2>&1)" || fail PULL "fetch failed: $(echo "$out" | tail -1)"
+git checkout -q "$BRANCH" 2>/dev/null || fail PULL "cannot check out $BRANCH"
+out="$(git merge -q --ff-only "origin/$BRANCH" 2>&1)" || fail PULL "not a fast-forward: $(echo "$out" | tail -1)"
+check PULL PASS "$(git log --oneline -1 | cut -c1-60)$note"
+
+# ENV: keep existing node values, override with non-empty deploy.env values
+cd GadsAuth
+echo "$OVERRIDES_B64" | base64 -d > .env.overrides || fail ENV "could not decode deploy.env"
+env_out="$(python3 - <<"PY" 2>&1
+import os, re, secrets
+def parse(path):
+    out = {}
+    if os.path.exists(path):
+        for line in open(path):
+            m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line.rstrip("\n"))
+            if m:
+                out[m.group(1)] = m.group(2).strip()
+    return out
+current = parse(".env")
+overrides = {k: v for k, v in parse(".env.overrides").items() if v.strip("\"\x27")}
+changed = sorted(k for k, v in overrides.items() if current.get(k) != v)
+current.update(overrides)
+if not current.get("FLASK_SECRET_KEY"):
+    current["FLASK_SECRET_KEY"] = secrets.token_hex(32)
+    changed.append("FLASK_SECRET_KEY(generated)")
+fd = os.open(".env.tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("# Managed by deploy.sh; values from deploy.env override this file on every deploy\n")
+    for k, v in current.items():
+        f.write(f"{k}={v}\n")
+os.replace(".env.tmp", ".env")
+print("changed: " + (" ".join(changed) if changed else "none"))
+PY
+)"
+rc=$?
+rm -f .env.overrides
+[ $rc -eq 0 ] || fail ENV "merge failed: $(echo "$env_out" | tail -1)"
+chmod 600 .env
+check ENV PASS "$env_out"
+
+# BUILD: rebuild the proxy (app.py is baked into the image), restart nginx (config is mounted)
+out="$($COMPOSE build -q gads-sso-proxy 2>&1)" || fail BUILD "build failed: $(echo "$out" | tail -1)"
+out="$($COMPOSE up -d 2>&1)" || fail BUILD "compose up failed: $(echo "$out" | grep -v "gads-net exists" | tail -1)"
+$DOCKER restart gads-nginx >/dev/null 2>&1 || fail BUILD "could not restart gads-nginx"
+sleep 4
+for c in gads-sso-proxy gads-nginx; do
+  state="$($DOCKER inspect -f "{{.State.Status}}" "$c" 2>/dev/null || echo missing)"
+  [ "$state" = "running" ] || fail BUILD "$c is $state"
+done
+check BUILD PASS "gads-sso-proxy and gads-nginx running"
+
+# NGINX: config test inside the container
+out="$($DOCKER exec gads-nginx nginx -t 2>&1)" || fail NGINX "$(echo "$out" | grep -i emerg | tail -1)"
+check NGINX PASS "config ok"
+
+# HEALTH: proxy answers through nginx
+port="$(sed -n "s/^NGINX_PORT=//p" .env | tail -1)"; port="${port:-80}"
+health="$(curl -s -o /dev/null -w "%{http_code}" -m 10 "http://localhost:${port}/healthz" || true)"
+[ "$health" = "200" ] || fail HEALTH "http://localhost:${port}/healthz returned ${health:-no response}"
+check HEALTH PASS "localhost:${port}/healthz 200"
+
+# HUB: GADS hub behind the proxy (warning only)
+gport="$(sed -n "s/^GADS_PORT=//p" .env | tail -1)"; gport="${gport:-10000}"
+if curl -s -o /dev/null -m 5 "http://localhost:${gport}/"; then check HUB PASS "localhost:${gport} answering"
+else check HUB WARN "GADS hub not answering on localhost:${gport}"; fi
+
+# TUNNEL: cloudflared must send traffic to nginx (SSO), not straight to the hub
+if ! command -v cloudflared >/dev/null && ! systemctl cat cloudflared >/dev/null 2>&1; then
+  check TUNNEL WARN "cloudflared not installed on this node"
+  exit 0
+fi
+SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo -n"
+tunnel_out="$(NGINX_PORT="$port" GADS_PORT="$gport" SUDO="$SUDO" python3 - <<"PY" 2>&1
+import json, os, re, subprocess, sys, tempfile, time
+ng, gp = os.environ["NGINX_PORT"], os.environ["GADS_PORT"]
+sudo = os.environ["SUDO"].split()
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+def done(status, msg):
+    print(msg)
+    sys.exit({"PASS": 0, "WARN": 2, "FAIL": 1}[status])
+
+def read(path):
+    try:
+        return open(path).read()
+    except PermissionError:
+        r = run(sudo + ["cat", path])
+        return r.stdout if r.returncode == 0 else None
+    except FileNotFoundError:
+        return None
+
+LOCAL = r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])"
+def port_of(service):
+    m = re.match(r"^\w+://" + LOCAL + r":(\d+)", service or "")
+    return m.group(1) if m else None
+
+exec_start = run(["systemctl", "show", "-p", "ExecStart", "--value", "cloudflared"]).stdout
+unit_env = run(["systemctl", "show", "-p", "Environment", "--value", "cloudflared"]).stdout
+token_mode = "--token" in exec_start or "TUNNEL_TOKEN" in unit_env
+
+m = re.search(r"--config[ =](\S+)", exec_start)
+paths = ([m.group(1)] if m else []) + [
+    "/etc/cloudflared/config.yml", "/etc/cloudflared/config.yaml",
+    os.path.expanduser("~/.cloudflared/config.yml"), os.path.expanduser("~/.cloudflared/config.yaml"),
+]
+config_path = next((p for p in paths if (read(p) or "").find("ingress") >= 0), None)
+
+if config_path and not token_mode:
+    # Locally managed: rewrite rules that target the hub port, validate, restart
+    text = read(config_path)
+    rule = re.compile(r"^(\s*-?\s*service:\s*)[\"]?(\w+)://(" + LOCAL + r"):" + re.escape(gp) + r"[\"]?(\s*(#.*)?)$")
+    lines, moved = [], 0
+    for line in text.splitlines(keepends=True):
+        mm = rule.match(line.rstrip("\n"))
+        if mm:
+            line = mm.group(1) + "http://localhost:" + ng + (mm.group(4) or "") + "\n"
+            moved += 1
+        lines.append(line)
+    services = re.findall(r"service:\s*[\"]?(\S+?)[\"]?\s*(?:#.*)?$", text, re.M)
+    if not moved:
+        if any(port_of(s) == ng for s in services):
+            done("PASS", f"{config_path}: already routes to localhost:{ng}")
+        listed = ", ".join(services) or "none"
+        done("WARN", f"{config_path}: no rule targets localhost:{gp} or :{ng} (services: {listed})")
+    backup = config_path + ".bak-deploy-" + time.strftime("%Y%m%d-%H%M%S")
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write("".join(lines))
+    writer = [] if os.access(os.path.dirname(config_path), os.W_OK) else sudo
+    for cmd in (writer + ["cp", "-p", config_path, backup], writer + ["cp", tmp.name, config_path]):
+        r = run(cmd)
+        if r.returncode:
+            why = (r.stderr or "permission denied").strip()
+            done("FAIL", f"cannot write {config_path} ({why}); needs passwordless sudo")
+    os.unlink(tmp.name)
+    v = run(writer + ["cloudflared", "tunnel", "--config", config_path, "ingress", "validate"])
+    if v.returncode:
+        run(writer + ["cp", "-p", backup, config_path])
+        last = ((v.stderr or v.stdout).strip().splitlines() or ["no output"])[-1]
+        done("FAIL", f"new config failed validation, restored backup: {last}")
+    r = run(sudo + ["systemctl", "restart", "cloudflared"])
+    if r.returncode:
+        done("FAIL", f"updated {config_path} but could not restart cloudflared: {r.stderr.strip()}")
+    time.sleep(3)
+    state = run(["systemctl", "is-active", "cloudflared"]).stdout.strip()
+    if state != "active":
+        run(writer + ["cp", "-p", backup, config_path]); run(sudo + ["systemctl", "restart", "cloudflared"])
+        done("FAIL", f"cloudflared {state} after change, restored backup")
+    done("PASS", f"{config_path}: moved {moved} rule(s) localhost:{gp} -> localhost:{ng}, restarted (backup {os.path.basename(backup)})")
+
+if token_mode:
+    # Dashboard-managed: routes live at Cloudflare; read the last config cloudflared received
+    log = ""
+    for cmd in (sudo + ["journalctl", "-u", "cloudflared", "--no-pager", "-o", "cat", "-n", "5000"],
+                ["journalctl", "-u", "cloudflared", "--no-pager", "-o", "cat", "-n", "5000"]):
+        r = run(cmd)
+        if r.returncode == 0 and r.stdout.strip():
+            log = r.stdout
+            break
+    updates = [l for l in log.splitlines() if "Updated to new configuration" in l]
+    if not updates:
+        done("WARN", "dashboard-managed tunnel; routes not found in cloudflared logs (check the dashboard)")
+    raw = updates[-1]
+    mm = re.search(r"config=\"(.*)\"\s+version=", raw)
+    routes = []
+    if mm:
+        try:
+            cfg = json.loads(mm.group(1).replace("\\\"", "\""))
+            routes = [(r.get("hostname") or "*", r.get("service", "")) for r in cfg.get("ingress", [])]
+        except ValueError:
+            pass
+    if not routes:
+        routes = [("?", s) for s in re.findall(r"service\W+(\w+://[^\\\"]+)", raw)]
+    bad = [f"{h} -> {s}" for h, s in routes if port_of(s) == gp]
+    if bad:
+        done("FAIL", "dashboard-managed tunnel bypasses SSO: " + "; ".join(bad)
+             + f". Fix in Cloudflare (Networks > Tunnels > Public Hostname -> HTTP localhost:{ng})"
+             + f" or run: ./set-tunnel-port.py <hostname> --port {ng} --apply")
+    good = [f"{h} -> {s}" for h, s in routes if port_of(s) == ng]
+    if good:
+        done("PASS", "dashboard-managed: " + "; ".join(good))
+    done("WARN", "dashboard-managed; no route to localhost:" + ng + " (" + "; ".join(f"{h} -> {s}" for h, s in routes) + ")")
+
+done("WARN", "cloudflared found but no config.yml or tunnel token; cannot tell where it routes")
+PY
+)"
+case $? in
+  0) check TUNNEL PASS "$tunnel_out" ;;
+  2) check TUNNEL WARN "$tunnel_out" ;;
+  *) fail TUNNEL "$tunnel_out" ;;
+esac
+'
+
+CHECKS=(SSH PREREQ REPO PULL ENV BUILD NGINX HEALTH HUB TUNNEL)
+
+# ---------- Main loop ----------
+REPORT_DIR="$SCRIPT_DIR/deploy-reports"
+mkdir -p "$REPORT_DIR"
+REPORT="$REPORT_DIR/deploy-$(date +%Y%m%d-%H%M%S).csv"
+echo "node,result,$(IFS=,; echo "${CHECKS[*]}"),detail" > "$REPORT"
+
+declare -a NODES=() STATUSES=() RESULTS=() DETAILS=()
+count=0
+
+# Records one node's outcome. Statuses are space-separated, one per entry in CHECKS.
+record() {
+  NODES+=("$1"); STATUSES+=("$2"); RESULTS+=("$3"); DETAILS+=("$4")
+  local csv_detail="${4//\"/\'}"
+  echo "$1,$3,${2// /,},\"$csv_detail\"" >> "$REPORT"
+}
+
+while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
+  user="$(echo "${user:-}" | tr -d '\r' | xargs)"
+  ip="$(echo "${ip:-}" | tr -d '\r' | xargs)"
+  pass="$(printf '%s' "${pass:-}" | tr -d '\r')"
+  [[ -z "$user" || "$user" == \#* || "$user" == "username" ]] && continue
+  [[ -n "$ONLY_IP" && "$ip" != "$ONLY_IP" ]] && continue
+  [[ -n "$ip" ]] || { warn "Skipping row for '$user': no ip"; continue; }
+  count=$((count + 1))
+
+  target="$user@$ip"
+  ctl="$WORK_DIR/ctl-$count"
+  out_file="$WORK_DIR/out-$count"
+  echo ""
+  log "━━━━━━━━ $target ━━━━━━━━"
+
+  if ! method="$(open_connection "$target" "$pass" "$ctl")"; then
+    node_log "$ip" "${RED}FAIL${NC} SSH: could not connect (network, key or password)"
+    statuses="FAIL"; for _ in "${CHECKS[@]:1}"; do statuses+=" SKIP"; done
+    record "$target" "$statuses" "FAIL" "SSH: could not connect"
+    continue
+  fi
+  node_log "$ip" "${GREEN}PASS${NC} SSH: $method auth"
+
+  if [[ "$method" == "password" && "$INSTALL_KEY" == true ]]; then
+    install_pubkey "$ctl" "$target" && node_log "$ip" "installed SSH key for future deploys"
+  fi
+
+  : > "$out_file"
+  set +e
+  run_remote "$ctl" "$target" bash -s -- "$BRANCH" "$REMOTE_DIR" "$OVERRIDES_B64" <<<"$REMOTE_SCRIPT" 2>&1 \
+    | while IFS= read -r line; do
+        echo "$line" >> "$out_file"
+        if [[ "$line" == @@CHECK\|* ]]; then
+          IFS='|' read -r _ name st detail <<<"$line"
+          case "$st" in
+            PASS) color="$GREEN" ;; WARN) color="$YELLOW" ;; *) color="$RED" ;;
+          esac
+          node_log "$ip" "${color}${st}${NC} ${name}: ${detail}"
+        else
+          node_log "$ip" "  $line"
+        fi
+      done
+  set -e
+  close_connection "$ctl" "$target"
+
+  # Build the status row; checks never reached are SKIP
+  statuses="PASS"; result="PASS"; detail=""
+  for name in "${CHECKS[@]:1}"; do
+    line="$(grep -E "^@@CHECK\|$name\|" "$out_file" | tail -1 || true)"
+    if [[ -z "$line" ]]; then
+      st="SKIP"
+    else
+      IFS='|' read -r _ _ st d <<<"$line"
+      if [[ "$st" == "FAIL" ]]; then result="FAIL"; detail="$name: $d"; fi
+      if [[ "$st" == "WARN" && -z "$detail" ]]; then detail="$name: $d"; fi
+    fi
+    statuses+=" $st"
+  done
+  # Lost connection or crash before HEALTH reported anything
+  if [[ "$result" == "PASS" ]] && ! grep -q "^@@CHECK|HEALTH|PASS" "$out_file"; then
+    result="FAIL"; detail="connection lost or script stopped: $(grep -v '^@@CHECK' "$out_file" | tail -1)"
+  fi
+  record "$target" "$statuses" "$result" "$detail"
+done < "$NODES_FILE"
+
+[[ $count -gt 0 ]] || err "No nodes to deploy${ONLY_IP:+ matching $ONLY_IP} in $NODES_FILE"
+
+# ---------- Summary ----------
+color_status() {
+  case "$1" in
+    PASS) printf "${GREEN}%-7s${NC}" "$1" ;;
+    FAIL) printf "${RED}%-7s${NC}" "$1" ;;
+    WARN) printf "${YELLOW}%-7s${NC}" "$1" ;;
+    *)    printf "%-7s" "$1" ;;
+  esac
+}
+
+echo ""
+log "━━━━━━━━ Summary ━━━━━━━━"
+width=4
+for n in "${NODES[@]}"; do (( ${#n} > width )) && width=${#n}; done
+printf "  %-${width}s  %-7s" "NODE" "RESULT"
+for c in "${CHECKS[@]}"; do printf " %-7s" "$c"; done
+echo ""
+failed=0
+for i in "${!NODES[@]}"; do
+  printf "  %-${width}s  " "${NODES[$i]}"
+  color_status "${RESULTS[$i]}"
+  for st in ${STATUSES[$i]}; do printf " "; color_status "$st"; done
+  echo ""
+  [[ "${RESULTS[$i]}" == "PASS" ]] || failed=$((failed + 1))
+done
+echo ""
+for i in "${!NODES[@]}"; do
+  [[ -n "${DETAILS[$i]}" ]] && echo -e "  ${NODES[$i]}: ${DETAILS[$i]}"
+done
+echo ""
+log "$(( ${#NODES[@]} - failed ))/${#NODES[@]} nodes passed. Report: ${REPORT#$SCRIPT_DIR/}"
+[[ $failed -eq 0 ]] || exit 1
