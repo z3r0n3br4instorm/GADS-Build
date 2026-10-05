@@ -14,15 +14,16 @@ set -euo pipefail
 #   4. Rebuilds gads-sso-proxy and restarts gads-nginx
 #   5. Checks nginx config and /healthz
 #   6. Points cloudflared at nginx (port 80) if a local config.yml routes to the hub;
-#      for dashboard-managed tunnels, checks the routes and fails if they bypass SSO
+#      dashboard-managed tunnels take their ingress from the Cloudflare edge, so those are
+#      repointed over the API (needs CLOUDFLARE_API_TOKEN in deploy.env) and re-checked
 #   7. Prints a PASS/FAIL table per node
 #      and saves it to deploy-reports/
 #
 # Usage:
-#   ./deploy.sh                          # deploy.env + nodes.csv next to this script
-#   ./deploy.sh -e prod.env -n prod.csv  # other files
-#   ./deploy.sh --only 192.168.1.253     # a single node from the CSV
-#   ./deploy.sh --install-key            # also install your SSH key on password nodes
+#   ./deploy.sh                            # deploy.env + nodes.csv next to this script
+#   ./deploy.sh -e prod.env -n prod.csv    # other files
+#   ./deploy.sh --only 192.168.1.253       # a single node from the CSV
+#   ./deploy.sh --install-key              # also install your SSH key on password nodes
 #
 # nodes.csv format (header required, password may be empty for key-only nodes):
 #   username,ip,password
@@ -46,7 +47,7 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 node_log() { echo -e "${BLUE}[$1]${NC} $2"; }
 
-usage() { sed -n '17,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '22,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------- Arguments ----------
 while [[ $# -gt 0 ]]; do
@@ -65,7 +66,8 @@ done
 [[ -f "$NODES_FILE" ]] || err "Nodes file not found: $NODES_FILE (copy nodes.csv.example)"
 
 for f in "$ENV_FILE" "$NODES_FILE"; do
-  perms="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+  # GNU stat first: on Linux "-f" means filesystem, succeeds, and prints a block of noise
+  perms="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null)"
   if [[ "$perms" != "600" && "$perms" != "400" ]]; then
     warn "$f contains secrets but is mode $perms — consider: chmod 600 $f"
   fi
@@ -75,6 +77,7 @@ done
 env_get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//' || true; }
 BRANCH="$(env_get DEPLOY_BRANCH)";       BRANCH="${BRANCH:-main}"
 REMOTE_DIR="$(env_get DEPLOY_REMOTE_DIR)"; REMOTE_DIR="${REMOTE_DIR:-GADS-Build}"
+CF_TOKEN="$(env_get CLOUDFLARE_API_TOKEN)"
 
 for key in AUTH0_DOMAIN AUTH0_CLIENT_ID AUTH0_CLIENT_SECRET; do
   [[ -n "$(env_get "$key")" ]] || err "$key is empty in $ENV_FILE"
@@ -138,6 +141,28 @@ run_remote() {
 
 close_connection() {
   ssh -o ControlPath="$1" -O exit "$2" </dev/null >/dev/null 2>&1 || true
+}
+
+# Runs a remote script, appending every line to a log file and printing check results.
+# @@TUNNEL_BYPASS lines are machine-readable and consumed by the caller, so they stay hidden.
+stream_checks() {
+  local ctl="$1" target="$2" ip="$3" out_file="$4" script="$5"; shift 5
+  set +e
+  run_remote "$ctl" "$target" bash -s -- "$@" <<<"$script" 2>&1 \
+    | while IFS= read -r line; do
+        echo "$line" >> "$out_file"
+        case "$line" in
+          @@CHECK\|*)
+            IFS='|' read -r _ name st detail <<<"$line"
+            case "$st" in
+              PASS) color="$GREEN" ;; WARN) color="$YELLOW" ;; *) color="$RED" ;;
+            esac
+            node_log "$ip" "${color}${st}${NC} ${name}: ${detail}" ;;
+          @@TUNNEL_BYPASS\|*) ;;
+          *) node_log "$ip" "  $line" ;;
+        esac
+      done
+  set -e
 }
 
 install_pubkey() {
@@ -246,8 +271,17 @@ check HEALTH PASS "localhost:${port}/healthz 200"
 gport="$(sed -n "s/^GADS_PORT=//p" .env | tail -1)"; gport="${gport:-10000}"
 if curl -s -o /dev/null -m 5 "http://localhost:${gport}/"; then check HUB PASS "localhost:${gport} answering"
 else check HUB WARN "GADS hub not answering on localhost:${gport}"; fi
+'
 
-# TUNNEL: cloudflared must send traffic to nginx (SSO), not straight to the hub
+# ---------- Tunnel check (runs on the node, separately so it can be re-run) ----------
+# Args: remote dir. Prints "@@CHECK|TUNNEL|..." and, when routes bypass SSO,
+# "@@TUNNEL_BYPASS|<nginx port>|<hostnames>" so the caller can fix them over the API.
+TUNNEL_SCRIPT='
+REMOTE_DIR="$1"
+check() { printf "@@CHECK|%s|%s|%s\n" "$1" "$2" "$3"; }
+cd ~/"$REMOTE_DIR"/GadsAuth 2>/dev/null || { check TUNNEL WARN "GadsAuth not found on node"; exit 0; }
+port="$(sed -n "s/^NGINX_PORT=//p" .env | tail -1)"; port="${port:-80}"
+gport="$(sed -n "s/^GADS_PORT=//p" .env | tail -1)"; gport="${gport:-10000}"
 if ! command -v cloudflared >/dev/null && ! systemctl cat cloudflared >/dev/null 2>&1; then
   check TUNNEL WARN "cloudflared not installed on this node"
   exit 0
@@ -356,22 +390,37 @@ if token_mode:
     if not routes:
         routes = [("?", s) for s in re.findall(r"service\W+(\w+://[^\\\"]+)", raw)]
     bad = [f"{h} -> {s}" for h, s in routes if port_of(s) == gp]
-    if bad:
-        done("FAIL", "dashboard-managed tunnel bypasses SSO: " + "; ".join(bad)
-             + f". Fix in Cloudflare (Networks > Tunnels > Public Hostname -> HTTP localhost:{ng})"
-             + f" or run: ./set-tunnel-port.py <hostname> --port {ng} --apply")
     good = [f"{h} -> {s}" for h, s in routes if port_of(s) == ng]
-    if good:
-        done("PASS", "dashboard-managed: " + "; ".join(good))
-    done("WARN", "dashboard-managed; no route to localhost:" + ng + " (" + "; ".join(f"{h} -> {s}" for h, s in routes) + ")")
+    if not bad:
+        if good:
+            done("PASS", "dashboard-managed: " + "; ".join(good))
+        done("WARN", "dashboard-managed; no route to localhost:" + ng
+             + " (" + "; ".join(f"{h} -> {s}" for h, s in routes) + ")")
+
+    # cloudflared cannot override this from the node: for a dashboard-managed tunnel the
+    # connector fetches its ingress from the edge on every start and ignores local ingress
+    # rules. So hand the hostnames back and let the caller fix them over the Cloudflare API.
+    bad_hosts = sorted({h for h, s in routes if port_of(s) == gp and h not in ("*", "?")})
+    if bad_hosts:
+        print("BYPASS:" + " ".join(bad_hosts))
+    done("FAIL", "dashboard-managed tunnel bypasses SSO: " + "; ".join(bad)
+         + f". Needs its ingress changed at Cloudflare to HTTP localhost:{ng}"
+         + " (deploy.sh does that automatically when CLOUDFLARE_API_TOKEN is set)")
 
 done("WARN", "cloudflared found but no config.yml or tunnel token; cannot tell where it routes")
 PY
 )"
-case $? in
+rc=$?
+first="$(printf "%s" "$tunnel_out" | head -1)"
+case "$first" in
+  BYPASS:*)
+    printf "@@TUNNEL_BYPASS|%s|%s\n" "$port" "${first#BYPASS:}"
+    tunnel_out="$(printf "%s" "$tunnel_out" | tail -n +2)" ;;
+esac
+case $rc in
   0) check TUNNEL PASS "$tunnel_out" ;;
   2) check TUNNEL WARN "$tunnel_out" ;;
-  *) fail TUNNEL "$tunnel_out" ;;
+  *) check TUNNEL FAIL "$tunnel_out" ;;
 esac
 '
 
@@ -421,21 +470,34 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
   fi
 
   : > "$out_file"
-  set +e
-  run_remote "$ctl" "$target" bash -s -- "$BRANCH" "$REMOTE_DIR" "$OVERRIDES_B64" <<<"$REMOTE_SCRIPT" 2>&1 \
-    | while IFS= read -r line; do
-        echo "$line" >> "$out_file"
-        if [[ "$line" == @@CHECK\|* ]]; then
-          IFS='|' read -r _ name st detail <<<"$line"
-          case "$st" in
-            PASS) color="$GREEN" ;; WARN) color="$YELLOW" ;; *) color="$RED" ;;
-          esac
-          node_log "$ip" "${color}${st}${NC} ${name}: ${detail}"
-        else
-          node_log "$ip" "  $line"
+  stream_checks "$ctl" "$target" "$ip" "$out_file" "$REMOTE_SCRIPT" \
+    "$BRANCH" "$REMOTE_DIR" "$OVERRIDES_B64"
+
+  # TUNNEL runs on its own so a dashboard route that bypasses SSO can be repointed over
+  # the Cloudflare API and then re-checked, rather than just reported
+  if grep -q "^@@CHECK|HEALTH|PASS" "$out_file"; then
+    stream_checks "$ctl" "$target" "$ip" "$out_file" "$TUNNEL_SCRIPT" "$REMOTE_DIR"
+    bypass_line="$(grep "^@@TUNNEL_BYPASS|" "$out_file" | tail -1 || true)"
+    if [[ -n "$bypass_line" ]]; then
+      IFS='|' read -r _ ng_port bypass_hosts <<<"$bypass_line"
+      if [[ -z "$CF_TOKEN" ]]; then
+        node_log "$ip" "  set CLOUDFLARE_API_TOKEN in ${ENV_FILE##*/} to let deploy.sh fix this"
+      else
+        node_log "$ip" "  repointing tunnel over the Cloudflare API: $bypass_hosts -> localhost:$ng_port"
+        set +e
+        # bypass_hosts is deliberately unquoted: it may hold several hostnames
+        cf_out="$("$SCRIPT_DIR/set-tunnel-port.py" $bypass_hosts --port "$ng_port" \
+                  --apply -e "$ENV_FILE" 2>&1)"
+        cf_rc=$?
+        set -e
+        while IFS= read -r l; do [[ -z "$l" ]] || node_log "$ip" "  $l"; done <<<"$cf_out"
+        if [[ $cf_rc -eq 0 ]]; then
+          sleep 8   # let the edge push the new ingress to the connector
+          stream_checks "$ctl" "$target" "$ip" "$out_file" "$TUNNEL_SCRIPT" "$REMOTE_DIR"
         fi
-      done
-  set -e
+      fi
+    fi
+  fi
   close_connection "$ctl" "$target"
 
   # Build the status row; checks never reached are SKIP
