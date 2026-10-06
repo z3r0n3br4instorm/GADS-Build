@@ -23,7 +23,12 @@ GADS_JWT_SECRET = os.environ.get("GADS_JWT_SECRET", "")
 GADS_USER_CLAIM = os.environ.get("GADS_USER_CLAIM", "username")
 GADS_TENANT_CLAIM = os.environ.get("GADS_TENANT_CLAIM", "tenant")
 GADS_TENANT_VALUE = os.environ.get("GADS_TENANT_VALUE", "assurecraft")
+# Token handed to GADS on each proxied request. Short-lived: it is re-minted per request,
+# so nothing has to survive longer than the request itself.
 GADS_TOKEN_TTL_SECONDS = int(os.environ.get("GADS_TOKEN_TTL_SECONDS", "300"))
+# Token handed to the browser (localStorage, for the React SPA). Longer-lived because the
+# SPA holds it between page loads, and refreshed silently from /auth/token before it expires.
+GADS_SESSION_TOKEN_TTL_SECONDS = int(os.environ.get("GADS_SESSION_TOKEN_TTL_SECONDS", "3600"))
 GADS_DEFAULT_ROLE = os.environ.get("GADS_DEFAULT_ROLE", "user")
 GADS_ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("GADS_ADMIN_EMAILS", "").split(",") if e.strip()}
 GADS_PORT = os.environ.get("GADS_PORT", "10000")
@@ -271,20 +276,29 @@ def get_default_signing_info():
     )
     return secret, tenant
 
-def mint_gads_jwt(email):
-    """Mint a GADS-compatible JWT (for the React frontend to store and for proxying)."""
+def mint_gads_jwt(email, ttl_seconds=None):
+    """Mint a GADS-compatible JWT. Defaults to the short per-request TTL."""
     now = datetime.now(timezone.utc)
+    ttl = GADS_TOKEN_TTL_SECONDS if ttl_seconds is None else ttl_seconds
     role = "admin" if email in GADS_ADMIN_EMAILS else GADS_DEFAULT_ROLE
     scopes = ["user", "admin"] if role == "admin" else ["user"]
     secret, tenant = get_default_signing_info()
     payload = {
         "iss": "gads", "sub": email,
-        "exp": int((now + timedelta(hours=12)).timestamp()),
+        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
         "iat": int(now.timestamp()),
         "username": email, "role": role, "scope": scopes,
         "tenant": tenant,
     }
     return pyjwt.encode(payload, secret, algorithm="HS256")
+
+def mint_session_jwt(email):
+    """Mint the longer-lived JWT the browser keeps in localStorage."""
+    return mint_gads_jwt(email, GADS_SESSION_TOKEN_TTL_SECONDS)
+
+def token_refresh_interval_ms():
+    """How often the browser should silently renew, comfortably before expiry."""
+    return max(60, GADS_SESSION_TOKEN_TTL_SECONDS // 2) * 1000
 
 def mint_origin_jwt(email):
     """Mint a JWT for GADS requests."""
@@ -306,7 +320,7 @@ def proxy_to_gads(path):
     ct = resp.headers.get("Content-Type", "text/html")
     body = resp.content
     if "text/html" in ct and b"</head>" in body:
-        gadstoken = mint_gads_jwt(email)
+        gadstoken = mint_session_jwt(email)
         role = ensure_gads_user(email)
         secret, tenant = get_default_signing_info()
         tenant_str = tenant or ""
@@ -406,7 +420,7 @@ def callback():
     role = ensure_gads_user(email)
 
     # 2. Mint GADS JWT token and fetch tenant info for React app
-    gadstoken = mint_gads_jwt(email)
+    gadstoken = mint_session_jwt(email)
     secret, tenant = get_default_signing_info()
 
     log.info("Successfully authenticated user '%s' (role: %s), auto-logging into GADS and redirecting to '%s'", email, role, dest)
@@ -463,25 +477,90 @@ def verify():
     email = session.get("user_email")
     if email:
         role = ensure_gads_user(email)
-        token = mint_gads_jwt(email)
         secret, tenant = get_default_signing_info()
 
+        upstream_token = mint_gads_jwt(email)
         resp = make_response("", 200)
-        resp.headers["X-GADS-Auth-Token"] = token
-        resp.headers["X-GADS-React-Token"] = token
+        # Short-lived token for the upstream request; longer-lived one for the browser
+        resp.headers["X-GADS-Auth-Token"] = upstream_token
+        resp.headers["X-GADS-React-Token"] = mint_session_jwt(email)
         resp.headers["X-GADS-User"] = email
         resp.headers["X-GADS-Role"] = role
         resp.headers["X-GADS-Tenant"] = tenant or ""
         resp.headers["X-GADS-Mode"] = "sso"
+        resp.headers["X-GADS-Refresh-Ms"] = str(token_refresh_interval_ms())
+        # The exact Authorization header nginx should send upstream. Always the freshly
+        # minted token, so a stale one the SPA is still holding never reaches GADS.
+        resp.headers["X-GADS-Authorization"] = f"Bearer {upstream_token}"
         return resp
 
     # Allow request if user is in legacy auth mode
     if request.cookies.get("gads_legacy") == "1":
         resp = make_response("", 200)
         resp.headers["X-GADS-Mode"] = "legacy"
+        # Legacy users authenticate against GADS directly, so pass their own header through
+        resp.headers["X-GADS-Authorization"] = request.headers.get("Authorization", "")
         return resp
 
     return jsonify({"error": "not_authenticated"}), 401
+
+@app.route("/auth/token")
+def auth_token():
+    """Silent renewal: hand the browser a fresh GADS JWT while the SSO session is alive.
+
+    The SPA calls this on a timer, so an expired GADS token never reaches the user as a
+    logout. A 401 here means the SSO session itself is gone, and the browser is expected
+    to go to /auth/logout, which ends up back at the Auth0 login screen.
+    """
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "not_authenticated"}), 401
+
+    # Touching the session re-issues the cookie, sliding the session window for active users
+    session.permanent = True
+    session["renewed_at"] = int(time.time())
+
+    role = ensure_gads_user(email)
+    secret, tenant = get_default_signing_info()
+    resp = jsonify({
+        "accessToken": mint_session_jwt(email),
+        "username": email,
+        "role": role,
+        "tenant": tenant or "",
+        "expires_in": GADS_SESSION_TOKEN_TTL_SECONDS,
+        "refresh_ms": token_refresh_interval_ms(),
+    })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+def proxy_legacy(path):
+    """Pass a request straight through to GADS, for users who opted into legacy auth."""
+    gads_url = f"http://host.docker.internal:{GADS_PORT}/{path}"
+    if request.query_string:
+        gads_url += f"?{request.query_string.decode()}"
+    headers = {"Host": request.host}
+    if request.headers.get("Authorization"):
+        headers["Authorization"] = request.headers["Authorization"]
+    resp = http_requests.get(gads_url, headers=headers, timeout=30)
+    return Response(resp.content, status=resp.status_code,
+                    content_type=resp.headers.get("Content-Type", "text/html"))
+
+@app.route("/login")
+@app.route("/login/")
+def gads_login_page():
+    """GADS's native login form is never where an SSO user should land.
+
+    Reached when the SPA decides its token is gone and routes itself to /login. If the SSO
+    session is still good the user is simply sent back into the app (a fresh token is seeded
+    on load); otherwise they go to Auth0, not to the GADS form.
+    """
+    if request.cookies.get("gads_legacy") == "1" and not session.get("user_email"):
+        return proxy_legacy("login")
+    if session.get("user_email"):
+        log.info("SPA routed to /login with a live SSO session; returning to the app")
+        return redirect("/")
+    log.info("SPA routed to /login with no SSO session; sending to Auth0")
+    return redirect("/auth/login?redirect=/")
 
 @app.route("/healthz")
 def healthz():
@@ -510,7 +589,7 @@ def authenticate():
             content_type=resp.headers.get("Content-Type", "application/json")
         )
     role = ensure_gads_user(email)
-    gadstoken = mint_gads_jwt(email)
+    gadstoken = mint_session_jwt(email)
     secret, tenant = get_default_signing_info()
     return jsonify({
         "success": True, "message": "",
@@ -518,7 +597,7 @@ def authenticate():
             "access_token": gadstoken,
             "accessToken": gadstoken,
             "token_type": "Bearer",
-            "expires_in": 43200,
+            "expires_in": GADS_SESSION_TOKEN_TTL_SECONDS,
             "username": email,
             "role": role,
             "tenant": tenant or "",
@@ -605,14 +684,7 @@ window.location.href = {json.dumps(auth0_logout)};
 @app.route("/<path:path>")
 def catch_all(path):
     if request.cookies.get("gads_legacy") == "1" and not session.get("user_email"):
-        gads_url = f"http://host.docker.internal:{GADS_PORT}/{path}"
-        if request.query_string:
-            gads_url += f"?{request.query_string.decode()}"
-        headers = {"Host": request.host}
-        if request.headers.get("Authorization"):
-            headers["Authorization"] = request.headers["Authorization"]
-        resp = http_requests.get(gads_url, headers=headers, timeout=30)
-        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "text/html"))
+        return proxy_legacy(path)
     email = session.get("user_email")
     if not email:
         if path == "" or path in ("health", "favicon.ico") or path.startswith("admin/") or path.startswith("api/"):

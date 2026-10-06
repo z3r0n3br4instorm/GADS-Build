@@ -4,3 +4,4 @@ nodes.csv
 GadsAuth/.env
 __pycache__/
 deploy-reports/
+*.env
