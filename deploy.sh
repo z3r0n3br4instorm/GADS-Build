@@ -173,6 +173,53 @@ install_pubkey() {
     k="$(cat)"; grep -qxF "$k" ~/.ssh/authorized_keys || echo "$k" >> ~/.ssh/authorized_keys' < "$pub"
 }
 
+# ---------- Node-side discovery helpers (prepended to the scripts below) ----------
+# The running gads-hub.service unit is the authoritative source for where GADS is
+# installed and which port it listens on. GadsAuth/.env and the built-in defaults are
+# only fallbacks, so a node with the hub in ~/GADS instead of ~/GADS-Build still works.
+NODE_HELPERS='
+gads_hub_exec() { systemctl show -p ExecStart --value gads-hub.service 2>/dev/null; }
+
+# Hub install directory: WorkingDirectory if set, else the directory of its binary
+gads_hub_dir() {
+  local d bin
+  d="$(systemctl show -p WorkingDirectory --value gads-hub.service 2>/dev/null)"
+  if [ -z "$d" ]; then
+    bin="$(gads_hub_exec | sed -n "s/.*argv\[\]=\([^ ]*\).*/\1/p" | head -1)"
+    [ -n "$bin" ] && d="$(dirname "$bin")"
+  fi
+  printf "%s\n" "$d"
+}
+
+# Hub listen port from the unit, accepting --port=N or --port N
+gads_hub_port() {
+  gads_hub_exec | sed -n "s/.*--port[= ]\([0-9]\{1,\}\).*/\1/p" | head -1
+}
+
+# First candidate that actually holds the GadsAuth deployment. An explicit
+# DEPLOY_REMOTE_DIR wins; otherwise the unit tells us where to look.
+resolve_repo_dir() {
+  local prefer="$1" c
+  for c in ${prefer:+"$HOME/$prefer"} "$HOME/GADS-Build" "$(gads_hub_dir)" "$HOME/GADS"; do
+    [ -n "$c" ] || continue
+    if [ -f "$c/GadsAuth/docker-compose.yml" ] && [ -d "$c/.git" ]; then
+      printf "%s\n" "$c"; return 0
+    fi
+  done
+  return 1
+}
+
+# Hub port with documented precedence: unit, then .env, then the default
+resolve_gads_port() {
+  local p
+  p="$(gads_hub_port)"
+  if [ -n "$p" ]; then printf "%s unit\n" "$p"; return; fi
+  p="$(sed -n "s/^GADS_PORT=//p" .env 2>/dev/null | tail -1)"
+  if [ -n "$p" ]; then printf "%s .env\n" "$p"; return; fi
+  printf "10000 default\n"
+}
+'
+
 # ---------- Remote deploy steps (runs on the node) ----------
 # Args: branch, remote dir, base64 env overrides
 # Each check prints "@@CHECK|<name>|PASS|FAIL|WARN|<detail>"; the first FAIL stops the node.
@@ -193,11 +240,11 @@ if $DOCKER compose version >/dev/null 2>&1; then COMPOSE="$DOCKER compose"
 else COMPOSE="${DOCKER%docker}docker-compose"; fi
 check PREREQ PASS "git, docker, python3, curl"
 
-# REPO: must already exist in the home directory; never cloned here
-[ -d "$HOME/$REMOTE_DIR/.git" ] || fail REPO "~/$REMOTE_DIR is not a git repo on this node (not cloning)"
-cd "$HOME/$REMOTE_DIR" || fail REPO "cannot enter ~/$REMOTE_DIR"
-[ -f GadsAuth/docker-compose.yml ] || fail REPO "~/$REMOTE_DIR/GadsAuth/docker-compose.yml missing"
-check REPO PASS "~/$REMOTE_DIR"
+# REPO: must already exist on the node; never cloned here. Located from the gads-hub
+# unit when it is not at the expected path, so an install in ~/GADS still deploys.
+REPO_DIR="$(resolve_repo_dir "$REMOTE_DIR")" || fail REPO "no GadsAuth checkout found (tried ~/$REMOTE_DIR, ~/GADS-Build, $(gads_hub_dir) from gads-hub.service, ~/GADS); each must be a git repo containing GadsAuth/docker-compose.yml"
+cd "$REPO_DIR" || fail REPO "cannot enter $REPO_DIR"
+check REPO PASS "${REPO_DIR#$HOME/}$([ "$REPO_DIR" = "$HOME/$REMOTE_DIR" ] || echo " (discovered, not ~/$REMOTE_DIR)")"
 
 # PULL: back up local edits, then fast-forward to origin
 note=""
@@ -267,10 +314,10 @@ health="$(curl -s -o /dev/null -w "%{http_code}" -m 10 "http://localhost:${port}
 [ "$health" = "200" ] || fail HEALTH "http://localhost:${port}/healthz returned ${health:-no response}"
 check HEALTH PASS "localhost:${port}/healthz 200"
 
-# HUB: GADS hub behind the proxy (warning only)
-gport="$(sed -n "s/^GADS_PORT=//p" .env | tail -1)"; gport="${gport:-10000}"
-if curl -s -o /dev/null -m 5 "http://localhost:${gport}/"; then check HUB PASS "localhost:${gport} answering"
-else check HUB WARN "GADS hub not answering on localhost:${gport}"; fi
+# HUB: GADS hub behind the proxy (warning only). Port comes from the running unit.
+gport_info="$(resolve_gads_port)"; gport="${gport_info%% *}"; gport_src="${gport_info#* }"
+if curl -s -o /dev/null -m 5 "http://localhost:${gport}/"; then check HUB PASS "localhost:${gport} answering (port from $gport_src)"
+else check HUB WARN "GADS hub not answering on localhost:${gport} (port from $gport_src)"; fi
 '
 
 # ---------- Tunnel check (runs on the node, separately so it can be re-run) ----------
@@ -279,9 +326,11 @@ else check HUB WARN "GADS hub not answering on localhost:${gport}"; fi
 TUNNEL_SCRIPT='
 REMOTE_DIR="$1"
 check() { printf "@@CHECK|%s|%s|%s\n" "$1" "$2" "$3"; }
-cd ~/"$REMOTE_DIR"/GadsAuth 2>/dev/null || { check TUNNEL WARN "GadsAuth not found on node"; exit 0; }
-port="$(sed -n "s/^NGINX_PORT=//p" .env | tail -1)"; port="${port:-80}"
-gport="$(sed -n "s/^GADS_PORT=//p" .env | tail -1)"; gport="${gport:-10000}"
+# nginx port lives in GadsAuth/.env; the hub port comes from the gads-hub unit. Missing
+# checkout is not fatal here: the tunnel can still be checked against the unit port.
+REPO_DIR="$(resolve_repo_dir "$REMOTE_DIR")" && cd "$REPO_DIR/GadsAuth" 2>/dev/null
+port="$(sed -n "s/^NGINX_PORT=//p" .env 2>/dev/null | tail -1)"; port="${port:-80}"
+gport_info="$(resolve_gads_port)"; gport="${gport_info%% *}"
 if ! command -v cloudflared >/dev/null && ! systemctl cat cloudflared >/dev/null 2>&1; then
   check TUNNEL WARN "cloudflared not installed on this node"
   exit 0
@@ -470,13 +519,13 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
   fi
 
   : > "$out_file"
-  stream_checks "$ctl" "$target" "$ip" "$out_file" "$REMOTE_SCRIPT" \
+  stream_checks "$ctl" "$target" "$ip" "$out_file" "$NODE_HELPERS$REMOTE_SCRIPT" \
     "$BRANCH" "$REMOTE_DIR" "$OVERRIDES_B64"
 
   # TUNNEL runs on its own so a dashboard route that bypasses SSO can be repointed over
   # the Cloudflare API and then re-checked, rather than just reported
   if grep -q "^@@CHECK|HEALTH|PASS" "$out_file"; then
-    stream_checks "$ctl" "$target" "$ip" "$out_file" "$TUNNEL_SCRIPT" "$REMOTE_DIR"
+    stream_checks "$ctl" "$target" "$ip" "$out_file" "$NODE_HELPERS$TUNNEL_SCRIPT" "$REMOTE_DIR"
     bypass_line="$(grep "^@@TUNNEL_BYPASS|" "$out_file" | tail -1 || true)"
     if [[ -n "$bypass_line" ]]; then
       IFS='|' read -r _ ng_port bypass_hosts <<<"$bypass_line"
@@ -493,7 +542,7 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
         while IFS= read -r l; do [[ -z "$l" ]] || node_log "$ip" "  $l"; done <<<"$cf_out"
         if [[ $cf_rc -eq 0 ]]; then
           sleep 8   # let the edge push the new ingress to the connector
-          stream_checks "$ctl" "$target" "$ip" "$out_file" "$TUNNEL_SCRIPT" "$REMOTE_DIR"
+          stream_checks "$ctl" "$target" "$ip" "$out_file" "$NODE_HELPERS$TUNNEL_SCRIPT" "$REMOTE_DIR"
         fi
       fi
     fi
