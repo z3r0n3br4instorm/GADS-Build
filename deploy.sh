@@ -222,7 +222,7 @@ resolve_repo_dir() {
   return 1
 }
 
-# How this deployment is updated: "git <dir>" when resolve_repo_dir's match is a git
+# How this deployment is updated: "git <dir>" when the resolve_repo_dir match is a git
 # checkout (fetch+merge applies), otherwise "scp <dir>" - <dir> is that match, or
 # $HOME/<prefer> as where a first-ever scp push should land when nothing exists yet.
 resolve_repo_mode() {
@@ -256,7 +256,7 @@ fail()  { check "$1" FAIL "$2"; exit 1; }
 cd ~ || fail PREREQ "no home directory"
 
 # PREREQ: tools and docker access. git is only needed on a git-managed node; an
-# scp-managed node (MODE=scp, enabled by the controller'"'"'s --scp flag) never touches git.
+# scp-managed node (MODE=scp, enabled by the --scp flag) never touches git.
 tools="docker python3 curl"; [ "$MODE" = "git" ] && tools="git $tools"
 for tool in $tools; do
   command -v "$tool" >/dev/null || fail PREREQ "$tool is not installed"
@@ -269,7 +269,7 @@ else COMPOSE="${DOCKER%docker}docker-compose"; fi
 check PREREQ PASS "docker, python3, curl$([ "$MODE" = "git" ] && echo ", git")"
 
 if [ "$MODE" = "scp" ]; then
-  # REPO/PULL: the controller already pushed GadsAuth'"'"'s files here via scp (--scp),
+  # REPO/PULL: the controller already pushed the GadsAuth files here via scp (--scp),
   # since this node has no git checkout. Nothing to fetch; just confirm they arrived.
   [ -z "$SCP_ERR" ] || fail REPO "$SCP_ERR"
   REPO_DIR="$SCP_DIR"
