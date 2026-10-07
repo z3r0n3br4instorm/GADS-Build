@@ -10,8 +10,8 @@ set -euo pipefail
 # For each node it:
 #   1. Connects over SSH (key first, then the CSV password)
 #   2. Updates GadsAuth on the node: git fetch+merge if it is a git checkout; otherwise,
-#      with --scp, the controller pushes GadsAuth's files there directly (no GitHub
-#      needed on that node). Without --scp, a node with no git checkout fails here.
+#      the controller pushes the GadsAuth files there over scp (no GitHub needed on
+#      that node). With --no-scp, a node with no git checkout fails here instead.
 #   3. Merges deploy.env into the node's GadsAuth/.env
 #   4. Rebuilds gads-sso-proxy and restarts gads-nginx
 #   5. Checks nginx config and /healthz
@@ -26,8 +26,8 @@ set -euo pipefail
 #   ./deploy.sh -e prod.env -n prod.csv    # other files
 #   ./deploy.sh --only 192.168.1.253       # a single node from the CSV
 #   ./deploy.sh --install-key              # also install your SSH key on password nodes
-#   ./deploy.sh --scp                       # also allow scp-managed nodes (no git on the node;
-#                                            #   this machine pushes GadsAuth's files instead)
+#   ./deploy.sh --no-scp                   # fail nodes with no git checkout instead of
+#                                          #   pushing the GadsAuth files to them over scp
 #
 # nodes.csv format (header required, password may be empty for key-only nodes):
 #   username,ip,password
@@ -38,7 +38,7 @@ ENV_FILE="$SCRIPT_DIR/deploy.env"
 NODES_FILE="$SCRIPT_DIR/nodes.csv"
 ONLY_IP=""
 INSTALL_KEY=false
-SCP_MODE=false
+SCP_MODE=true
 
 # Colors
 RED='\033[0;31m'
@@ -62,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --only)        ONLY_IP="$2"; shift 2 ;;
     --install-key) INSTALL_KEY=true; shift ;;
     --scp)         SCP_MODE=true; shift ;;
+    --no-scp)      SCP_MODE=false; shift ;;
     -h|--help)     usage 0 ;;
     *)             echo "Unknown option: $1"; usage 1 ;;
   esac
@@ -191,7 +192,17 @@ if [ -x /usr/libexec/path_helper ]; then eval "$(/usr/libexec/path_helper -s)"; 
 PATH="$PATH:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin"
 export PATH
 
-gads_hub_exec() { systemctl show -p ExecStart --value gads-hub.service 2>/dev/null; }
+GADS_HUB_PLIST="$HOME/Library/LaunchAgents/com.gads.hub.plist"
+
+# Hub command line: the systemd unit on Linux, the launchd plist on macOS
+gads_hub_exec() {
+  local out
+  out="$(systemctl show -p ExecStart --value gads-hub.service 2>/dev/null)"
+  if [ -z "$out" ] && [ -f "$GADS_HUB_PLIST" ]; then
+    out="$(sed -n "s/.*<string>\(.*\)<\/string>.*/\1/p" "$GADS_HUB_PLIST" | tr "\n" " ")"
+  fi
+  printf "%s\n" "$out"
+}
 
 # Hub install directory: WorkingDirectory if set, else the directory of its binary
 gads_hub_dir() {
@@ -201,6 +212,11 @@ gads_hub_dir() {
     bin="$(gads_hub_exec | sed -n "s/.*argv\[\]=\([^ ]*\).*/\1/p" | head -1)"
     [ -n "$bin" ] && d="$(dirname "$bin")"
   fi
+  # macOS: launchd plist, then the usual install location
+  if [ -z "$d" ] && [ -f "$GADS_HUB_PLIST" ]; then
+    d="$(awk "/<key>WorkingDirectory<\\/key>/{getline; gsub(/.*<string>|<\\/string>.*/,\"\"); print; exit}" "$GADS_HUB_PLIST")"
+  fi
+  if [ -z "$d" ] && [ -x "$HOME/Documents/GADS/GADS" ]; then d="$HOME/Documents/GADS"; fi
   printf "%s\n" "$d"
 }
 
@@ -213,7 +229,7 @@ gads_hub_port() {
 # DEPLOY_REMOTE_DIR wins; otherwise the unit tells us where to look.
 resolve_repo_dir() {
   local prefer="$1" c
-  for c in ${prefer:+"$HOME/$prefer"} "$HOME/GADS-Build" "$(gads_hub_dir)" "$HOME/GADS"; do
+  for c in ${prefer:+"$HOME/$prefer"} "$HOME/GADS-Build" "$(gads_hub_dir)" "$HOME/GADS" "$HOME/Documents/GADS"; do
     [ -n "$c" ] || continue
     if [ -f "$c/GadsAuth/docker-compose.yml" ]; then
       printf "%s\n" "$c"; return 0
@@ -223,16 +239,17 @@ resolve_repo_dir() {
 }
 
 # How this deployment is updated: "git <dir>" when the resolve_repo_dir match is a git
-# checkout (fetch+merge applies), otherwise "scp <dir>" - <dir> is that match, or
-# $HOME/<prefer> as where a first-ever scp push should land when nothing exists yet.
+# checkout (fetch+merge applies), otherwise "scp <dir>" - <dir> is that match, or for a
+# first-ever scp push the folder GADS itself is installed in, else $HOME/<prefer>.
 resolve_repo_mode() {
   local prefer="$1" d
   d="$(resolve_repo_dir "$prefer")"
   if [ -n "$d" ] && [ -d "$d/.git" ]; then
-    printf "git %s\n" "$d"
-  else
-    printf "scp %s\n" "${d:-$HOME/$prefer}"
+    printf "git %s\n" "$d"; return
   fi
+  [ -n "$d" ] || d="$(gads_hub_dir)"
+  [ -d "$d" ] || d="$HOME/$prefer"
+  printf "scp %s\n" "$d"
 }
 
 # Hub port with documented precedence: unit, then .env, then the default
@@ -280,7 +297,7 @@ if [ "$MODE" = "scp" ]; then
 else
   # REPO: must already exist on the node; never cloned here. Located from the gads-hub
   # unit when it is not at the expected path, so an install in ~/GADS still deploys.
-  REPO_DIR="$(resolve_repo_dir "$REMOTE_DIR")" || fail REPO "no GadsAuth checkout found (tried ~/$REMOTE_DIR, ~/GADS-Build, $(gads_hub_dir) from gads-hub.service, ~/GADS); each must be a git repo containing GadsAuth/docker-compose.yml. Pass --scp to push files to a node with no git instead."
+  REPO_DIR="$(resolve_repo_dir "$REMOTE_DIR")" || fail REPO "no GadsAuth checkout found (tried ~/$REMOTE_DIR, ~/GADS-Build, $(gads_hub_dir) from gads-hub.service, ~/GADS); each must be a git repo containing GadsAuth/docker-compose.yml."
   cd "$REPO_DIR" || fail REPO "cannot enter $REPO_DIR"
   check REPO PASS "${REPO_DIR#$HOME/}$([ "$REPO_DIR" = "$HOME/$REMOTE_DIR" ] || echo " (discovered, not ~/$REMOTE_DIR)")"
 
