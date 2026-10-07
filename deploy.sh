@@ -350,8 +350,52 @@ chmod 600 .env
 check ENV PASS "$env_out"
 
 # BUILD: rebuild the proxy (app.py is baked into the image), restart nginx (config is mounted)
-out="$($COMPOSE build -q gads-sso-proxy 2>&1)" || fail BUILD "build failed: $(echo "$out" | tail -1)"
-out="$($COMPOSE up -d 2>&1)" || fail BUILD "compose up failed: $(echo "$out" | grep -v "gads-net exists" | tail -1)"
+# Both steps are time-limited and echo their progress, so a stuck image pull or build
+# shows where it stopped instead of hanging the whole deploy with no output.
+bounded() {
+  local limit="$1" log="$2" pid waited=0 shown=0 total
+  shift 2
+  "$@" >"$log" 2>&1 </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5; waited=$((waited + 5))
+    total="$(wc -l < "$log" | tr -d " ")"
+    if [ "$total" -gt "$shown" ]; then
+      sed -n "$((shown + 1)),${total}p" "$log" | grep -E "^#[0-9]+ (\[|DONE|CACHED|ERROR)|[Ee]rror|Pull|Container" | tail -3
+      shown="$total"
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return 124
+    fi
+  done
+  wait "$pid"
+}
+# macOS: over SSH the login keychain is locked, and Docker Desktop asks it for registry
+# credentials even for public images, which stalls or fails the pull. Use a copy of the
+# docker config without the keychain helper; contexts and plugins stay the same.
+if [ "$(uname)" = "Darwin" ] && grep -q "credsStore" "$HOME/.docker/config.json" 2>/dev/null; then
+  DOCKER_CONFIG="$(mktemp -d)"; export DOCKER_CONFIG
+  python3 - <<"PY"
+import json, os
+cfg = json.load(open(os.path.expanduser("~/.docker/config.json")))
+cfg.pop("credsStore", None); cfg.pop("credHelpers", None)
+json.dump(cfg, open(os.path.join(os.environ["DOCKER_CONFIG"], "config.json"), "w"))
+PY
+  for d in contexts cli-plugins; do
+    [ -e "$HOME/.docker/$d" ] && ln -s "$HOME/.docker/$d" "$DOCKER_CONFIG/$d"
+  done
+  echo "macOS: using docker config without the keychain credential helper"
+fi
+build_log="$(mktemp)"
+BUILDKIT_PROGRESS=plain; export BUILDKIT_PROGRESS
+bounded "${BUILD_TIMEOUT:-900}" "$build_log" $COMPOSE build gads-sso-proxy; rc=$?
+[ $rc -ne 124 ] || fail BUILD "build timed out after ${BUILD_TIMEOUT:-900}s; last output: $(tail -1 "$build_log")"
+[ $rc -eq 0 ] || fail BUILD "build failed: $(tail -1 "$build_log")"
+bounded 300 "$build_log" $COMPOSE up -d; rc=$?
+[ $rc -ne 124 ] || fail BUILD "compose up timed out after 300s; last output: $(tail -1 "$build_log")"
+[ $rc -eq 0 ] || fail BUILD "compose up failed: $(grep -v "gads-net exists" "$build_log" | tail -1)"
+rm -f "$build_log"
 $DOCKER restart gads-nginx >/dev/null 2>&1 || fail BUILD "could not restart gads-nginx"
 sleep 4
 for c in gads-sso-proxy gads-nginx; do
