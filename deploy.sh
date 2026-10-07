@@ -178,6 +178,13 @@ install_pubkey() {
 # installed and which port it listens on. GadsAuth/.env and the built-in defaults are
 # only fallbacks, so a node with the hub in ~/GADS instead of ~/GADS-Build still works.
 NODE_HELPERS='
+# macOS runs path_helper only for login shells, so a non-interactive `ssh ... bash -s`
+# session (what this script uses) never sees the Docker Desktop CLI even though it is
+# installed and works fine in an interactive terminal. Harmless no-op on Linux.
+if [ -x /usr/libexec/path_helper ]; then eval "$(/usr/libexec/path_helper -s)"; fi
+PATH="$PATH:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin"
+export PATH
+
 gads_hub_exec() { systemctl show -p ExecStart --value gads-hub.service 2>/dev/null; }
 
 # Hub install directory: WorkingDirectory if set, else the directory of its binary
@@ -342,7 +349,12 @@ ng, gp = os.environ["NGINX_PORT"], os.environ["GADS_PORT"]
 sudo = os.environ["SUDO"].split()
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    # Degrade like the bash helpers do on a node with no systemd (e.g. macOS): treat a
+    # missing binary as a failed command instead of crashing the whole check.
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: not found")
 
 def done(status, msg):
     print(msg)
