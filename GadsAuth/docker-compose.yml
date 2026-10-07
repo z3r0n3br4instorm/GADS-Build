@@ -21,7 +21,10 @@ services:
   # nginx — reverse proxy that enforces SSO on every request to GADS
   # ---------------------------------------------------------------------------
   nginx:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    image: gads-nginx:local
     container_name: gads-nginx
     restart: unless-stopped
     ports:
@@ -30,8 +33,6 @@ services:
       - .env
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach GADS on the host
-    volumes:
-      - ./nginx-gads.conf:/etc/nginx/templates/default.conf.template:ro
     depends_on:
       - gads-sso-proxy
     networks:

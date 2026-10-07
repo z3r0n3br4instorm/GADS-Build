@@ -349,7 +349,7 @@ rm -f .env.overrides
 chmod 600 .env
 check ENV PASS "$env_out"
 
-# BUILD: rebuild the proxy (app.py is baked into the image), restart nginx (config is mounted)
+# BUILD: rebuild the proxy and nginx images (app.py and the nginx config are baked in)
 # Both steps are time-limited and echo their progress, so a stuck image pull or build
 # shows where it stopped instead of hanging the whole deploy with no output.
 bounded() {
@@ -389,11 +389,11 @@ PY
 fi
 build_log="$(mktemp)"
 BUILDKIT_PROGRESS=plain; export BUILDKIT_PROGRESS
-bounded "${BUILD_TIMEOUT:-900}" "$build_log" $COMPOSE build gads-sso-proxy; rc=$?
-[ $rc -ne 124 ] || fail BUILD "build timed out after ${BUILD_TIMEOUT:-900}s; last output: $(tail -1 "$build_log")"
+bounded "${BUILD_TIMEOUT:-900}" "$build_log" $COMPOSE build gads-sso-proxy nginx; rc=$?
+[ $rc -ne 124 ] || fail BUILD "build timed out after ${BUILD_TIMEOUT:-900}s; last output: $(grep -v "^[[:space:]]*$" "$build_log" | tail -1)"
 [ $rc -eq 0 ] || fail BUILD "build failed: $(tail -1 "$build_log")"
 bounded 300 "$build_log" $COMPOSE up -d; rc=$?
-[ $rc -ne 124 ] || fail BUILD "compose up timed out after 300s; last output: $(tail -1 "$build_log")"
+[ $rc -ne 124 ] || fail BUILD "compose up timed out after 300s; last output: $(grep -v "^[[:space:]]*$" "$build_log" | tail -1)"
 [ $rc -eq 0 ] || fail BUILD "compose up failed: $(grep -v "gads-net exists" "$build_log" | tail -1)"
 rm -f "$build_log"
 $DOCKER restart gads-nginx >/dev/null 2>&1 || fail BUILD "could not restart gads-nginx"
@@ -638,9 +638,9 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
       if ! run_remote "$ctl" "$target" "mkdir -p '$SCP_DIR/GadsAuth'" 2>/dev/null; then
         SCP_ERR="could not create $SCP_DIR/GadsAuth on the node"
       elif scp -o ControlPath="$ctl" -o BatchMode=yes \
-           "$SCRIPT_DIR"/GadsAuth/{docker-compose.yml,nginx-gads.conf,Dockerfile,app.py,requirements.txt} \
+           "$SCRIPT_DIR"/GadsAuth/{docker-compose.yml,nginx-gads.conf,Dockerfile,Dockerfile.nginx,app.py,requirements.txt} \
            "$target:$SCP_DIR/GadsAuth/" >/dev/null 2>"$WORK_DIR/scp-err-$count"; then
-        node_log "$ip" "pushed docker-compose.yml, nginx-gads.conf, Dockerfile, app.py, requirements.txt"
+        node_log "$ip" "pushed docker-compose.yml, nginx-gads.conf, Dockerfile, Dockerfile.nginx, app.py, requirements.txt"
       else
         SCP_ERR="scp push failed: $(tail -1 "$WORK_DIR/scp-err-$count")"
       fi

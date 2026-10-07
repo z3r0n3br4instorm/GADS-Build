@@ -1,0 +1,7 @@
+# nginx with the GADS SSO config baked in.
+# The config is copied into the image rather than bind-mounted, so the container does
+# not depend on Docker being allowed to read the host folder it is deployed from
+# (macOS blocks ~/Documents until someone approves a prompt on the desktop).
+FROM nginx:alpine
+
+COPY nginx-gads.conf /etc/nginx/templates/default.conf.template
