@@ -9,7 +9,9 @@ set -euo pipefail
 #
 # For each node it:
 #   1. Connects over SSH (key first, then the CSV password)
-#   2. Pulls the repo from GitHub (it must already exist in ~; nodes without it fail)
+#   2. Updates GadsAuth on the node: git fetch+merge if it is a git checkout; otherwise,
+#      with --scp, the controller pushes GadsAuth's files there directly (no GitHub
+#      needed on that node). Without --scp, a node with no git checkout fails here.
 #   3. Merges deploy.env into the node's GadsAuth/.env
 #   4. Rebuilds gads-sso-proxy and restarts gads-nginx
 #   5. Checks nginx config and /healthz
@@ -24,6 +26,8 @@ set -euo pipefail
 #   ./deploy.sh -e prod.env -n prod.csv    # other files
 #   ./deploy.sh --only 192.168.1.253       # a single node from the CSV
 #   ./deploy.sh --install-key              # also install your SSH key on password nodes
+#   ./deploy.sh --scp                       # also allow scp-managed nodes (no git on the node;
+#                                            #   this machine pushes GadsAuth's files instead)
 #
 # nodes.csv format (header required, password may be empty for key-only nodes):
 #   username,ip,password
@@ -34,6 +38,7 @@ ENV_FILE="$SCRIPT_DIR/deploy.env"
 NODES_FILE="$SCRIPT_DIR/nodes.csv"
 ONLY_IP=""
 INSTALL_KEY=false
+SCP_MODE=false
 
 # Colors
 RED='\033[0;31m'
@@ -47,7 +52,7 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 node_log() { echo -e "${BLUE}[$1]${NC} $2"; }
 
-usage() { sed -n '22,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '24,31p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------- Arguments ----------
 while [[ $# -gt 0 ]]; do
@@ -56,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     -n|--nodes)    NODES_FILE="$2"; shift 2 ;;
     --only)        ONLY_IP="$2"; shift 2 ;;
     --install-key) INSTALL_KEY=true; shift ;;
+    --scp)         SCP_MODE=true; shift ;;
     -h|--help)     usage 0 ;;
     *)             echo "Unknown option: $1"; usage 1 ;;
   esac
@@ -209,11 +215,24 @@ resolve_repo_dir() {
   local prefer="$1" c
   for c in ${prefer:+"$HOME/$prefer"} "$HOME/GADS-Build" "$(gads_hub_dir)" "$HOME/GADS"; do
     [ -n "$c" ] || continue
-    if [ -f "$c/GadsAuth/docker-compose.yml" ] && [ -d "$c/.git" ]; then
+    if [ -f "$c/GadsAuth/docker-compose.yml" ]; then
       printf "%s\n" "$c"; return 0
     fi
   done
   return 1
+}
+
+# How this deployment is updated: "git <dir>" when resolve_repo_dir's match is a git
+# checkout (fetch+merge applies), otherwise "scp <dir>" - <dir> is that match, or
+# $HOME/<prefer> as where a first-ever scp push should land when nothing exists yet.
+resolve_repo_mode() {
+  local prefer="$1" d
+  d="$(resolve_repo_dir "$prefer")"
+  if [ -n "$d" ] && [ -d "$d/.git" ]; then
+    printf "git %s\n" "$d"
+  else
+    printf "scp %s\n" "${d:-$HOME/$prefer}"
+  fi
 }
 
 # Hub port with documented precedence: unit, then .env, then the default
@@ -231,13 +250,15 @@ resolve_gads_port() {
 # Args: branch, remote dir, base64 env overrides
 # Each check prints "@@CHECK|<name>|PASS|FAIL|WARN|<detail>"; the first FAIL stops the node.
 REMOTE_SCRIPT='
-BRANCH="$1"; REMOTE_DIR="$2"; OVERRIDES_B64="$3"
+BRANCH="$1"; REMOTE_DIR="$2"; OVERRIDES_B64="$3"; MODE="${4:-git}"; SCP_DIR="$5"; SCP_ERR="$6"
 check() { printf "@@CHECK|%s|%s|%s\n" "$1" "$2" "$3"; }
 fail()  { check "$1" FAIL "$2"; exit 1; }
 cd ~ || fail PREREQ "no home directory"
 
-# PREREQ: tools and docker access
-for tool in git docker python3 curl; do
+# PREREQ: tools and docker access. git is only needed on a git-managed node; an
+# scp-managed node (MODE=scp, enabled by the controller'"'"'s --scp flag) never touches git.
+tools="docker python3 curl"; [ "$MODE" = "git" ] && tools="git $tools"
+for tool in $tools; do
   command -v "$tool" >/dev/null || fail PREREQ "$tool is not installed"
 done
 if docker ps >/dev/null 2>&1; then DOCKER="docker"
@@ -245,25 +266,36 @@ elif sudo -n docker ps >/dev/null 2>&1; then DOCKER="sudo -n docker"
 else fail PREREQ "user cannot run docker (add it to the docker group)"; fi
 if $DOCKER compose version >/dev/null 2>&1; then COMPOSE="$DOCKER compose"
 else COMPOSE="${DOCKER%docker}docker-compose"; fi
-check PREREQ PASS "git, docker, python3, curl"
+check PREREQ PASS "docker, python3, curl$([ "$MODE" = "git" ] && echo ", git")"
 
-# REPO: must already exist on the node; never cloned here. Located from the gads-hub
-# unit when it is not at the expected path, so an install in ~/GADS still deploys.
-REPO_DIR="$(resolve_repo_dir "$REMOTE_DIR")" || fail REPO "no GadsAuth checkout found (tried ~/$REMOTE_DIR, ~/GADS-Build, $(gads_hub_dir) from gads-hub.service, ~/GADS); each must be a git repo containing GadsAuth/docker-compose.yml"
-cd "$REPO_DIR" || fail REPO "cannot enter $REPO_DIR"
-check REPO PASS "${REPO_DIR#$HOME/}$([ "$REPO_DIR" = "$HOME/$REMOTE_DIR" ] || echo " (discovered, not ~/$REMOTE_DIR)")"
+if [ "$MODE" = "scp" ]; then
+  # REPO/PULL: the controller already pushed GadsAuth'"'"'s files here via scp (--scp),
+  # since this node has no git checkout. Nothing to fetch; just confirm they arrived.
+  [ -z "$SCP_ERR" ] || fail REPO "$SCP_ERR"
+  REPO_DIR="$SCP_DIR"
+  [ -f "$REPO_DIR/GadsAuth/docker-compose.yml" ] || fail REPO "scp did not deliver $REPO_DIR/GadsAuth/docker-compose.yml"
+  cd "$REPO_DIR" || fail REPO "cannot enter $REPO_DIR"
+  check REPO PASS "${REPO_DIR#$HOME/} (scp-managed, no git on this node)"
+  check PULL PASS "files pushed from the controller via scp (no git on this node)"
+else
+  # REPO: must already exist on the node; never cloned here. Located from the gads-hub
+  # unit when it is not at the expected path, so an install in ~/GADS still deploys.
+  REPO_DIR="$(resolve_repo_dir "$REMOTE_DIR")" || fail REPO "no GadsAuth checkout found (tried ~/$REMOTE_DIR, ~/GADS-Build, $(gads_hub_dir) from gads-hub.service, ~/GADS); each must be a git repo containing GadsAuth/docker-compose.yml. Pass --scp to push files to a node with no git instead."
+  cd "$REPO_DIR" || fail REPO "cannot enter $REPO_DIR"
+  check REPO PASS "${REPO_DIR#$HOME/}$([ "$REPO_DIR" = "$HOME/$REMOTE_DIR" ] || echo " (discovered, not ~/$REMOTE_DIR)")"
 
-# PULL: back up local edits, then fast-forward to origin
-note=""
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  stash_msg="deploy.sh backup $(date +%Y%m%d-%H%M%S)"
-  git stash push -q -m "$stash_msg" || fail PULL "could not stash local edits"
-  note=" (local edits stashed: $stash_msg)"
+  # PULL: back up local edits, then fast-forward to origin
+  note=""
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    stash_msg="deploy.sh backup $(date +%Y%m%d-%H%M%S)"
+    git stash push -q -m "$stash_msg" || fail PULL "could not stash local edits"
+    note=" (local edits stashed: $stash_msg)"
+  fi
+  out="$(git fetch -q origin "$BRANCH" 2>&1)" || fail PULL "fetch failed: $(echo "$out" | tail -1)"
+  git checkout -q "$BRANCH" 2>/dev/null || fail PULL "cannot check out $BRANCH"
+  out="$(git merge -q --ff-only "origin/$BRANCH" 2>&1)" || fail PULL "not a fast-forward: $(echo "$out" | tail -1)"
+  check PULL PASS "$(git log --oneline -1 | cut -c1-60)$note"
 fi
-out="$(git fetch -q origin "$BRANCH" 2>&1)" || fail PULL "fetch failed: $(echo "$out" | tail -1)"
-git checkout -q "$BRANCH" 2>/dev/null || fail PULL "cannot check out $BRANCH"
-out="$(git merge -q --ff-only "origin/$BRANCH" 2>&1)" || fail PULL "not a fast-forward: $(echo "$out" | tail -1)"
-check PULL PASS "$(git log --oneline -1 | cut -c1-60)$note"
 
 # ENV: keep existing node values, override with non-empty deploy.env values
 cd GadsAuth
@@ -530,9 +562,33 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
     install_pubkey "$ctl" "$target" && node_log "$ip" "installed SSH key for future deploys"
   fi
 
+  # With --scp, a node that has no git checkout gets GadsAuth'"'"'s files pushed from
+  # here instead of failing REPO. A node that already has a git checkout is untouched
+  # and keeps updating via git, so --scp only ever adds a fallback, never overrides git.
+  # A push failure is handed to REMOTE_SCRIPT as SCP_ERR rather than reported here, so
+  # PREREQ still runs and reports first - same FAIL/SKIP ordering as every other node.
+  MODE="git"; SCP_DIR=""; SCP_ERR=""
+  if [[ "$SCP_MODE" == true ]]; then
+    probe="$(run_remote "$ctl" "$target" bash -s -- "$REMOTE_DIR" \
+      <<<"$NODE_HELPERS"'resolve_repo_mode "$1"' 2>/dev/null)"
+    read -r MODE SCP_DIR <<<"$probe"
+    if [[ "$MODE" == "scp" ]]; then
+      node_log "$ip" "no git checkout found; pushing GadsAuth files via scp to $SCP_DIR"
+      if ! run_remote "$ctl" "$target" "mkdir -p '$SCP_DIR/GadsAuth'" 2>/dev/null; then
+        SCP_ERR="could not create $SCP_DIR/GadsAuth on the node"
+      elif scp -o ControlPath="$ctl" -o BatchMode=yes \
+           "$SCRIPT_DIR"/GadsAuth/{docker-compose.yml,nginx-gads.conf,Dockerfile,app.py,requirements.txt} \
+           "$target:$SCP_DIR/GadsAuth/" >/dev/null 2>"$WORK_DIR/scp-err-$count"; then
+        node_log "$ip" "pushed docker-compose.yml, nginx-gads.conf, Dockerfile, app.py, requirements.txt"
+      else
+        SCP_ERR="scp push failed: $(tail -1 "$WORK_DIR/scp-err-$count")"
+      fi
+    fi
+  fi
+
   : > "$out_file"
   stream_checks "$ctl" "$target" "$ip" "$out_file" "$NODE_HELPERS$REMOTE_SCRIPT" \
-    "$BRANCH" "$REMOTE_DIR" "$OVERRIDES_B64"
+    "$BRANCH" "$REMOTE_DIR" "$OVERRIDES_B64" "$MODE" "$SCP_DIR" "$SCP_ERR"
 
   # TUNNEL runs on its own so a dashboard route that bypasses SSO can be repointed over
   # the Cloudflare API and then re-checked, rather than just reported
