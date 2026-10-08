@@ -102,6 +102,11 @@ auth0 = oauth.register(
 
 # --- MongoDB secret retrieval & caching ---
 _mongo_client = None
+# After a failed connection attempt, do not try again until this time. Every candidate
+# URI costs up to 1.5s, and several lookups run per request, so retrying on each one
+# turns a MongoDB outage into multi-second auth checks and request timeouts.
+_mongo_retry_at = 0
+MONGO_RETRY_SECONDS = int(os.environ.get("MONGO_RETRY_SECONDS", "30"))
 _key_cache = {}
 _key_cache_time = 0
 
@@ -166,13 +171,15 @@ def discover_mongo_ips_from_docker(container_name="gads-mongodb"):
 
 def get_mongo_db():
     """Connect to MongoDB using candidate hostnames/URIs."""
-    global _mongo_client
+    global _mongo_client, _mongo_retry_at
     if _mongo_client is not None:
         try:
             _mongo_client.admin.command("ping")
             return _mongo_client[MONGO_DB_NAME]
         except Exception:
             _mongo_client = None
+    if time.time() < _mongo_retry_at:
+        return None
 
     uris = []
     if MONGO_URI:
@@ -196,7 +203,12 @@ def get_mongo_db():
         except Exception as e:
             log.debug("MongoDB connection attempt to %s failed: %s", uri, e)
             continue
-    log.warning("Could not connect to MongoDB on any known candidate URI.")
+    _mongo_retry_at = time.time() + MONGO_RETRY_SECONDS
+    log.warning(
+        "Could not connect to MongoDB on any known candidate URI; retrying in %ds. "
+        "Tokens are signed with fallback values until then, which the hub may reject.",
+        MONGO_RETRY_SECONDS,
+    )
     return None
 
 def refresh_mongo_keys():

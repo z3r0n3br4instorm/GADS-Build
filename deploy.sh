@@ -417,6 +417,29 @@ for c in gads-sso-proxy gads-nginx; do
 done
 check BUILD PASS "gads-sso-proxy and gads-nginx running"
 
+# MONGO: the proxy reads the signing secret and tenant of this hub from MongoDB. The
+# installer runs gads-mongodb on the default bridge, which the proxy network cannot
+# reach, so attach it to gads-net. Without it logins are slow and the hub rejects tokens.
+if $DOCKER inspect gads-mongodb >/dev/null 2>&1; then
+  if ! $DOCKER inspect -f "{{json .NetworkSettings.Networks}}" gads-mongodb | grep -q "\"gads-net\""; then
+    $DOCKER network connect gads-net gads-mongodb >/dev/null 2>&1 && $DOCKER restart gads-sso-proxy >/dev/null 2>&1
+    sleep 3
+  fi
+fi
+mongo_out="$($DOCKER exec -i gads-sso-proxy python3 - <<"PY" 2>&1
+import os, socket
+hosts = [os.environ.get("MONGO_HOST", "gads-mongodb"), "host.docker.internal"]
+for h in hosts:
+    try:
+        socket.create_connection((h, int(os.environ.get("MONGO_PORT", "27017"))), 3).close()
+        print("proxy reaches MongoDB at " + h); raise SystemExit(0)
+    except OSError:
+        pass
+print("proxy cannot reach MongoDB (tried " + ", ".join(hosts) + "); logins will be slow and the hub will reject tokens")
+raise SystemExit(1)
+PY
+)" && check MONGO PASS "$mongo_out" || check MONGO FAIL "$mongo_out"
+
 # NGINX: config test inside the container
 out="$($DOCKER exec gads-nginx nginx -t 2>&1)" || fail NGINX "$(echo "$out" | grep -i emerg | tail -1)"
 check NGINX PASS "config ok"
@@ -591,7 +614,7 @@ case $rc in
 esac
 '
 
-CHECKS=(SSH PREREQ REPO PULL ENV BUILD NGINX HEALTH HUB TUNNEL)
+CHECKS=(SSH PREREQ REPO PULL ENV BUILD MONGO NGINX HEALTH HUB TUNNEL)
 
 # ---------- Main loop ----------
 REPORT_DIR="$SCRIPT_DIR/deploy-reports"
