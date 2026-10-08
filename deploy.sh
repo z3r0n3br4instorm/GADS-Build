@@ -664,6 +664,8 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
   # and keeps updating via git, so --scp only ever adds a fallback, never overrides git.
   # A push failure is handed to REMOTE_SCRIPT as SCP_ERR rather than reported here, so
   # PREREQ still runs and reports first - same FAIL/SKIP ordering as every other node.
+  # Every ssh/scp below takes its stdin from somewhere other than the nodes file this
+  # loop is reading, otherwise it swallows the remaining rows and the run ends early.
   MODE="git"; SCP_DIR=""; SCP_ERR=""
   if [[ "$SCP_MODE" == true ]]; then
     probe="$(run_remote "$ctl" "$target" bash -s -- "$REMOTE_DIR" \
@@ -671,11 +673,11 @@ while IFS=, read -r user ip pass || [[ -n "${user:-}" ]]; do
     read -r MODE SCP_DIR <<<"$probe"
     if [[ "$MODE" == "scp" ]]; then
       node_log "$ip" "no git checkout found; pushing GadsAuth files via scp to $SCP_DIR"
-      if ! run_remote "$ctl" "$target" "mkdir -p '$SCP_DIR/GadsAuth'" 2>/dev/null; then
+      if ! run_remote "$ctl" "$target" "mkdir -p '$SCP_DIR/GadsAuth'" </dev/null 2>/dev/null; then
         SCP_ERR="could not create $SCP_DIR/GadsAuth on the node"
       elif scp -o ControlPath="$ctl" -o BatchMode=yes \
            "$SCRIPT_DIR"/GadsAuth/{docker-compose.yml,nginx-gads.conf,Dockerfile,Dockerfile.nginx,app.py,requirements.txt} \
-           "$target:$SCP_DIR/GadsAuth/" >/dev/null 2>"$WORK_DIR/scp-err-$count"; then
+           "$target:$SCP_DIR/GadsAuth/" </dev/null >/dev/null 2>"$WORK_DIR/scp-err-$count"; then
         node_log "$ip" "pushed docker-compose.yml, nginx-gads.conf, Dockerfile, Dockerfile.nginx, app.py, requirements.txt"
       else
         SCP_ERR="scp push failed: $(tail -1 "$WORK_DIR/scp-err-$count")"
