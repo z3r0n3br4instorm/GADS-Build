@@ -4,6 +4,7 @@ GADS Software Update Engine
 ----------------------------
 Polls the configured git remote (read from .git/config) on the current branch.
 On detecting new commits, performs a git pull and restarts the GADS services.
+When the pull changed GadsAuth/, the Auth0 SSO proxy and nginx are rebuilt as well.
 """
 
 import subprocess
@@ -20,6 +21,7 @@ SERVICES      = [
     "gads-provider.service",
     "gads-hub.service",
 ]
+GADSAUTH_DIR  = os.path.join(REPO_DIR, "GadsAuth")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -87,6 +89,40 @@ def restart_services() -> None:
             )
 
 
+def changed_paths(old: str, new: str) -> list[str]:
+    result = run(["git", "diff", "--name-only", old, new], check=False)
+    return result.stdout.split() if result.returncode == 0 else []
+
+
+def rebuild_gadsauth() -> None:
+    """Rebuild the SSO proxy and nginx so a pulled GadsAuth change takes effect."""
+    if not os.path.exists(os.path.join(GADSAUTH_DIR, ".env")):
+        log.warning(
+            "GadsAuth changed but %s/.env is missing; run deploy.sh for this node.",
+            GADSAUTH_DIR,
+        )
+        return
+    for docker in (["docker"], ["sudo", "-n", "docker"]):
+        try:
+            if subprocess.run(docker + ["ps"], capture_output=True).returncode != 0:
+                continue
+            log.info("Rebuilding GadsAuth containers …")
+            result = subprocess.run(
+                docker + ["compose", "up", "-d", "--build"],
+                cwd=GADSAUTH_DIR, capture_output=True, text=True, timeout=1200,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            log.error("GadsAuth rebuild could not run: %s", exc)
+            return
+        if result.returncode == 0:
+            log.info("GadsAuth containers rebuilt.")
+        else:
+            lines = (result.stderr.strip() or result.stdout.strip()).splitlines()
+            log.error("GadsAuth rebuild failed: %s", lines[-1] if lines else "no output")
+        return
+    log.error("GadsAuth changed but this user cannot run docker.")
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -109,6 +145,8 @@ def main() -> None:
                     branch, local[:12], remote[:12],
                 )
                 pull(branch)
+                if any(p.startswith("GadsAuth/") for p in changed_paths(local, local_commit())):
+                    rebuild_gadsauth()
                 restart_services()
             else:
                 log.debug("No update detected. Branch '%s' is up to date.", branch)

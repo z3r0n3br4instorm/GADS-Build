@@ -1,0 +1,7 @@
+# deploy.sh secrets
+deploy.env
+nodes.csv
+GadsAuth/.env
+__pycache__/
+deploy-reports/
+*.env
