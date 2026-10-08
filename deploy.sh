@@ -25,6 +25,7 @@ set -euo pipefail
 #   ./deploy.sh                            # deploy.env + nodes.csv next to this script
 #   ./deploy.sh -e prod.env -n prod.csv    # other files
 #   ./deploy.sh --only 192.168.1.253       # a single node from the CSV
+#   ./deploy.sh --branch feat/development  # deploy that branch (default: the one checked out here)
 #   ./deploy.sh --install-key              # also install your SSH key on password nodes
 #   ./deploy.sh --no-scp                   # fail nodes with no git checkout instead of
 #                                          #   pushing the GadsAuth files to them over scp
@@ -37,6 +38,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/deploy.env"
 NODES_FILE="$SCRIPT_DIR/nodes.csv"
 ONLY_IP=""
+BRANCH_ARG=""
 INSTALL_KEY=false
 SCP_MODE=true
 
@@ -52,7 +54,7 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 node_log() { echo -e "${BLUE}[$1]${NC} $2"; }
 
-usage() { sed -n '24,31p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '24,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------- Arguments ----------
 while [[ $# -gt 0 ]]; do
@@ -60,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     -e|--env)      ENV_FILE="$2"; shift 2 ;;
     -n|--nodes)    NODES_FILE="$2"; shift 2 ;;
     --only)        ONLY_IP="$2"; shift 2 ;;
+    -b|--branch)   BRANCH_ARG="$2"; shift 2 ;;
     --install-key) INSTALL_KEY=true; shift ;;
     --scp)         SCP_MODE=true; shift ;;
     --no-scp)      SCP_MODE=false; shift ;;
@@ -82,13 +85,23 @@ done
 
 # Deploy-only settings (DEPLOY_*, CLOUDFLARE_*) are read here and never written to the node .env
 env_get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//' || true; }
-BRANCH="$(env_get DEPLOY_BRANCH)";       BRANCH="${BRANCH:-main}"
+# Branch the nodes are put on: --branch, else the branch checked out here (so running
+# this from main deploys main and from feat/development deploys feat/development),
+# else DEPLOY_BRANCH when this is not a git checkout or HEAD is detached, else main.
+BRANCH="$BRANCH_ARG"; BRANCH_SRC="--branch"
+if [[ -z "$BRANCH" ]]; then
+  BRANCH="$(git -C "$SCRIPT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"; BRANCH_SRC="checked out here"
+fi
+if [[ -z "$BRANCH" ]]; then BRANCH="$(env_get DEPLOY_BRANCH)"; BRANCH_SRC="DEPLOY_BRANCH"; fi
+if [[ -z "$BRANCH" ]]; then BRANCH="main"; BRANCH_SRC="default"; fi
 REMOTE_DIR="$(env_get DEPLOY_REMOTE_DIR)"; REMOTE_DIR="${REMOTE_DIR:-GADS-Build}"
 CF_TOKEN="$(env_get CLOUDFLARE_API_TOKEN)"
 
 for key in AUTH0_DOMAIN AUTH0_CLIENT_ID AUTH0_CLIENT_SECRET; do
   [[ -n "$(env_get "$key")" ]] || err "$key is empty in $ENV_FILE"
 done
+
+log "Deploying branch: $BRANCH ($BRANCH_SRC)"
 
 # Nodes pull from GitHub, so warn if local commits haven't been pushed
 if git -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null; then
